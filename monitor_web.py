@@ -6,7 +6,8 @@ http://localhost:5678
 - 检测到变化后：全量解密DB + 全量WAL patch
 - SSE 服务器推送
 """
-import hashlib, struct, os, sys, json, time, sqlite3, io, threading, queue, traceback
+import hashlib, struct, os, sys, json, time, sqlite3, io, threading, queue, traceback, subprocess
+import uuid
 import hmac as hmac_mod
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -253,6 +254,25 @@ class MonitorDBCache:
         lock = self._get_lock(rel_key)
         with lock:
             self._state.pop(rel_key, None)
+
+    def peek(self, rel_key):
+        """返回当前已解密文件路径,**不触发**重新解密 (即使源 mtime 变了)。
+
+        给主循环 hot path (check_updates → _lookup_latest_message) 用,
+        避免每次新消息都同步等待整个 message_N.db 重新全量解密 (10s+),
+        把主循环延迟从亚秒级飙到 8-125s。
+
+        返回的路径可能 stale (滞后 1 个 mtime 周期)。调用方应能容忍 stale
+        (比如查不到 latest_local_id 时跳过加 _shown_keys, 让 hidden 路径
+        异步兜底)。
+
+        get() 仍保留同步行为给真正需要最新的调用方 (hidden 路径异步线程)。
+        """
+        if not get_key_info(self.keys, rel_key):
+            return None
+        out_name = rel_key.replace('\\', '_').replace('/', '_')
+        out_path = os.path.join(self.tmp_dir, out_name)
+        return out_path if os.path.exists(out_path) else None
 
     def get(self, rel_key):
         """返回解密后的临时文件路径，mtime 变化时自动重新解密"""
@@ -935,37 +955,57 @@ class SessionMonitor:
             except OSError:
                 pass
 
-    def _lookup_latest_local_id(self, username, timestamp):
-        """从 message_N.db 查指定 username 在 timestamp 的最大 local_id。
+    def _lookup_latest_message(self, username, timestamp):
+        """从 message_N.db 查指定 username 在 timestamp 的最新一条消息，返回
+        (local_id, message_content)。
 
-        SessionTable 触发推送时调用此方法拿到对应 local_id，加到 _shown_keys 后
-        `_check_hidden_messages` 路径能用 (username, local_id) 精确去重，避免 issue #79
-        的"同秒同类型多条消息 10 丢 4"。
+        SessionTable 推送时调用：
+        - local_id 加入 _shown_keys，供 `_check_hidden_messages` 精确去重 (issue #79)
+        - message_content 用于替换 SessionTable.summary 的 ~80 字短截断 (issue #42)
 
-        时机风险：SessionTable 写入比 message DB 早几毫秒，可能查不到。查不到时返回 None，
-        调用方应选择跳过加 key（让 hidden 路径稍后补救并自己加 key）。
+        两者本就同行，合并到一次 SELECT，相比原 MAX(local_id) 不增加 IO。
+
+        时机风险：SessionTable 写入比 message DB 早几毫秒，可能查不到。查不到时返回
+        (None, None)，调用方跳过加 key，由 `_check_hidden_messages` 兜底。
         """
         if not self.db_cache or not self.username_db_map:
-            return None
+            return None, None
         db_keys = self.username_db_map.get(username, [])
         if not db_keys:
-            return None
+            return None, None
         table_name = f"Msg_{hashlib.md5(username.encode()).hexdigest()}"
         for db_key in db_keys:
-            dec_path = self.db_cache.get(db_key)
+            # 用 peek 不触发同步解密 (主线程 hot path)。如果缓存还 stale
+            # 没 latest_local_id, 让 hidden 异步路径稍后兜底加 _shown_keys。
+            # 见 MonitorDBCache.peek 注释关于为什么这里不能用 .get。
+            dec_path = self.db_cache.peek(db_key)
             if not dec_path:
                 continue
             try:
                 with closing(sqlite3.connect(f"file:{dec_path}?mode=ro&immutable=1", uri=True)) as conn:
                     row = conn.execute(
-                        f"SELECT MAX(local_id) FROM [{table_name}] WHERE create_time = ?",
+                        f"SELECT local_id, message_content, WCDB_CT_message_content "
+                        f"FROM [{table_name}] WHERE create_time = ? "
+                        f"ORDER BY local_id DESC LIMIT 1",
                         (timestamp,),
                     ).fetchone()
                     if row and row[0]:
-                        return row[0]
+                        local_id, mc, ct = row
+                        if isinstance(mc, bytes) and ct == 4:
+                            try:
+                                mc = _zstd_dctx.decompress(mc).decode('utf-8', errors='replace')
+                            except Exception:
+                                mc = mc.decode('utf-8', errors='replace')
+                        elif isinstance(mc, bytes):
+                            mc = mc.decode('utf-8', errors='replace')
+                        # 群消息 message_content 形如 'wxid_xxx:\n<正文>'，与
+                        # SessionTable.summary 调用方一致地剥离前缀
+                        if mc and ':\n' in mc:
+                            mc = mc.split(':\n', 1)[1]
+                        return local_id, mc
             except Exception:
                 continue
-        return None
+        return None, None
 
     def _check_hidden_messages(self, username, prev_ts, curr_ts, curr_msg_type, display, is_group, sender):
         """检查时间窗口内是否有被 session 摘要覆盖的消息（文字、图片、表情等）
@@ -1501,12 +1541,16 @@ class SessionMonitor:
 
                 new_msgs.append(msg_data)
                 # _shown_keys 改用 (username, local_id) 精确去重（issue #79）。
-                # SessionTable 不带 local_id，去 message_N.db 查 max(local_id) WHERE create_time=curr_ts。
+                # SessionTable 不带 local_id，去 message_N.db 查同时拿 local_id 和完整正文：
+                # - local_id 用于去重
+                # - 完整正文替换 SessionTable.summary 的 ~80 字短截断（issue #42）
                 # 查不到时（message DB 写入滞后于 SessionTable）跳过加 key，让 _check_hidden_messages
                 # 1 秒后查到时自己 emit 并加 key。这种情况下偶发轻微重复，但比丢消息好。
-                latest_local_id = self._lookup_latest_local_id(username, curr['timestamp'])
+                latest_local_id, full_content = self._lookup_latest_message(username, curr['timestamp'])
                 if latest_local_id is not None:
                     self._shown_keys.add((username, latest_local_id))
+                    if full_content and len(full_content) > len(msg_data['content']):
+                        msg_data['content'] = full_content
 
                 # 图片消息: 后台异步解密（不阻塞轮询）
                 if curr['msg_type'] == 3:
@@ -1631,15 +1675,51 @@ HTML_PAGE = '''<!DOCTYPE html>
 <title>微信消息监听</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0a0f;color:#e0e0e0;height:100vh;display:flex;flex-direction:column}
-.header{background:linear-gradient(135deg,#1a1a2e,#16213e);padding:14px 24px;border-bottom:1px solid rgba(255,255,255,.08);display:flex;align-items:center;gap:12px;flex-shrink:0}
+:root{
+  /* 颜色 */
+  --bg:#0a0a0f;--bg-elev:#12121a;
+  --surface:rgba(255,255,255,.04);--surface-hover:rgba(255,255,255,.07);
+  --border:rgba(255,255,255,.08);--border-strong:rgba(255,255,255,.16);
+  --text:#e8eaed;--text-dim:#9aa0a6;--text-faint:#5f6368;
+  --accent:#4fc3f7;--accent-bg:rgba(79,195,247,.12);
+  --success:#81c784;--warn:#ffd54f;--danger:#ef9a9a;
+  /* 4-step 间距 */
+  --s1:4px;--s2:8px;--s3:12px;--s4:16px;--s5:24px;--s6:32px;
+  /* 4-step 字号 */
+  --t1:11px;--t2:12px;--t3:13px;--t4:15px;--t5:18px;--t6:24px;
+  /* 圆角 */
+  --r1:6px;--r2:10px;--r3:14px;--r-pill:999px;
+  /* 阴影 */
+  --shadow-1:0 1px 2px rgba(0,0,0,.3);
+  --shadow-2:0 8px 24px rgba(0,0,0,.4);
+  --shadow-glow:0 0 0 1px var(--border),0 4px 14px rgba(79,195,247,.18);
+}
+/* 字体: 中文优先用苹方 / 思源, 避免 Segoe UI 把中文渲染糊 */
+body{
+  font-family:"PingFang SC","HarmonyOS Sans","Source Han Sans CN","Microsoft YaHei UI",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  background:radial-gradient(ellipse at top,#14142a 0%,#0a0a0f 60%) fixed;
+  color:var(--text);
+  height:100vh;display:flex;flex-direction:column;
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+}
+/* 顶部 header: sticky + 防按钮被挤掉
+   原本用 backdrop-filter:blur(20px) 但每次 SSE 推消息触发 reflow 都要 GPU
+   重绘整个 header, 在低端机 / 高频消息时拖慢渲染。改用纯渐变背景。 */
+.header{
+  background:linear-gradient(135deg,#1a1a2e,#16213e);
+  padding:14px 24px;
+  border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:12px;
+  flex-shrink:0;flex-wrap:wrap;row-gap:8px;
+  position:sticky;top:0;z-index:50;
+}
 .header h1{font-size:18px;font-weight:600;background:linear-gradient(90deg,#4fc3f7,#81c784);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .status{font-size:12px;padding:4px 10px;border-radius:12px;transition:all .3s}
 .status.ok{background:rgba(76,175,80,.15);color:#81c784;border:1px solid rgba(76,175,80,.3)}
 .status.ok::before{content:'';display:inline-block;width:6px;height:6px;border-radius:50%;background:#4caf50;margin-right:6px;animation:pulse 2s infinite}
 .status.err{background:rgba(244,67,54,.15);color:#ef9a9a;border:1px solid rgba(244,67,54,.3)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.stats{margin-left:auto;font-size:12px;color:#666;display:flex;gap:16px}
+.stats{margin-left:auto;font-size:var(--t2);color:var(--text-faint);display:flex;gap:var(--s4);min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .messages{flex:1;overflow-y:auto;padding:12px}
 .msg{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:10px 14px;margin-bottom:5px;transition:transform .3s ease}
 .msg:hover{background:rgba(255,255,255,.05)}
@@ -1690,8 +1770,8 @@ a.msg-link{text-decoration:none;color:inherit}
 ::-webkit-scrollbar{width:4px}
 ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:2px}
 /* 设置面板 */
-.settings-btn{background:none;border:1px solid rgba(255,255,255,.15);color:#888;font-size:16px;cursor:pointer;padding:4px 8px;border-radius:6px;transition:all .2s}
-.settings-btn:hover{color:#ccc;border-color:rgba(255,255,255,.3)}
+.settings-btn{background:none;border:1px solid var(--border-strong);color:var(--text-dim);font-size:16px;cursor:pointer;padding:6px 10px;border-radius:var(--r1);transition:all .2s;flex-shrink:0}
+.settings-btn:hover{color:var(--text);border-color:var(--accent);background:var(--accent-bg)}
 .settings-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);z-index:900}
 .settings-overlay.show{display:block}
 .settings-panel{position:fixed;top:0;right:-420px;width:400px;height:100%;background:#12121a;border-left:1px solid rgba(255,255,255,.1);z-index:901;transition:right .3s ease;display:flex;flex-direction:column;overflow:hidden}
@@ -1725,14 +1805,202 @@ a.msg-link{text-decoration:none;color:inherit}
 .add-rule-btn:hover{background:rgba(79,195,247,.2)}
 /* 通知高亮 */
 .msg.notify-hl{border-left:3px solid #ffd54f;background:rgba(255,213,79,.08);box-shadow:0 0 12px rgba(255,213,79,.1)}
+/* 导出筛选模态框 */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);backdrop-filter:blur(4px);z-index:1100;align-items:center;justify-content:center}
+.modal-overlay.show{display:flex;animation:fadeIn .15s ease-out}
+.modal{background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--r3);width:560px;max-width:90vw;max-height:85vh;display:flex;flex-direction:column;box-shadow:var(--shadow-2);overflow:hidden}
+.modal-h{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.modal-h h2{font-size:var(--t4);color:var(--text);font-weight:600}
+.modal-close{background:none;border:none;color:var(--text-faint);font-size:20px;cursor:pointer;padding:4px 10px;border-radius:var(--r1);transition:all .15s}
+.modal-close:hover{color:var(--text);background:var(--surface)}
+.modal-b{padding:16px 20px;overflow-y:auto;flex:1}
+.modal-f{padding:14px 20px;border-top:1px solid var(--border);display:flex;justify-content:space-between;gap:8px;align-items:center;flex-shrink:0;background:rgba(0,0,0,.2)}
+.modal-search{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:var(--r1);padding:8px 12px;color:var(--text);font-size:var(--t3);outline:none;font-family:inherit;margin-bottom:var(--s3)}
+.modal-search:focus{border-color:var(--accent)}
+.modal-search::placeholder{color:var(--text-faint)}
+.session-list{max-height:280px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--r1);background:rgba(0,0,0,.2)}
+.session-item{display:flex;align-items:center;gap:var(--s2);padding:8px 12px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,.03);transition:background .1s;font-size:var(--t3)}
+.session-item:hover{background:var(--surface-hover)}
+.session-item:last-child{border-bottom:none}
+.session-item input[type=checkbox]{accent-color:var(--accent);width:14px;height:14px;cursor:pointer;margin:0}
+.session-type{font-size:10px;padding:2px 6px;border-radius:var(--r-pill);color:var(--text-dim);background:var(--surface);min-width:28px;text-align:center;flex-shrink:0}
+.session-type.grp{background:rgba(206,147,216,.12);color:#ce93d8}
+.session-type.single{background:rgba(79,195,247,.12);color:var(--accent)}
+.session-name{flex:1;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.session-ts{font-size:var(--t1);color:var(--text-faint);flex-shrink:0;font-family:Consolas,monospace}
+.modal-selctrl{display:flex;gap:var(--s2);margin:var(--s3) 0;flex-wrap:wrap}
+.modal-selctrl button{background:var(--surface);border:1px solid var(--border);color:var(--text-dim);padding:5px 10px;border-radius:var(--r1);font-size:var(--t1);cursor:pointer;transition:all .15s;font-family:inherit}
+.modal-selctrl button:hover{background:var(--surface-hover);color:var(--text)}
+.modal-section{margin-top:var(--s4)}
+.modal-section-label{font-size:var(--t1);color:var(--text-faint);margin-bottom:var(--s2);text-transform:uppercase;letter-spacing:1.2px;font-weight:600}
+.modal-fmt{display:flex;gap:var(--s4);flex-wrap:wrap}
+.modal-fmt label{display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:var(--t3);color:var(--text)}
+.modal-fmt input{accent-color:var(--accent);width:14px;height:14px;cursor:pointer}
+.modal-selcount{color:var(--text-dim);font-size:var(--t2)}
+.modal-btn{padding:8px 18px;border-radius:var(--r1);font-size:var(--t3);cursor:pointer;border:none;font-family:inherit;font-weight:500;transition:all .15s}
+.modal-btn.secondary{background:var(--surface);color:var(--text-dim);border:1px solid var(--border)}
+.modal-btn.secondary:hover{background:var(--surface-hover);color:var(--text)}
+.modal-btn.primary{background:linear-gradient(135deg,#4fc3f7,#29b6f6);color:#001528;font-weight:600;box-shadow:0 4px 14px rgba(79,195,247,.35)}
+.modal-btn.primary:hover:not(:disabled){background:linear-gradient(135deg,#5fd0ff,#3fc4ff);transform:translateY(-1px)}
+.modal-btn:disabled{opacity:.4;cursor:not-allowed;transform:none!important}
+.modal-loading{text-align:center;color:var(--text-faint);padding:30px;font-size:var(--t3)}
+/* Icon 通用样式 (替代 emoji) */
+.i{width:16px;height:16px;display:inline-block;vertical-align:-3px;flex-shrink:0;color:inherit}
+.i-sm{width:13px;height:13px;vertical-align:-2px}
+.i-lg{width:20px;height:20px;vertical-align:-5px}
+.i-xl{width:32px;height:32px;vertical-align:middle}
+.spin{animation:spin 1s linear infinite;transform-origin:center}
+@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+/* 工具面板 (Web 版替代 tkinter app_gui.py) */
+.tools-btn{background:none;border:1px solid var(--border-strong);color:var(--text-dim);font-size:var(--t3);cursor:pointer;padding:6px 12px;border-radius:var(--r1);transition:all .2s;margin-left:var(--s2);flex-shrink:0;font-weight:500}
+.tools-btn:hover{color:var(--accent);border-color:var(--accent);background:var(--accent-bg)}
+#toolsPanel{display:none;background:var(--bg-elev);border-top:1px solid var(--border);padding:0;flex-shrink:0;max-height:60vh;overflow:hidden;flex-direction:column;box-shadow:inset 0 8px 16px -8px rgba(0,0,0,.4)}
+#toolsPanel.show{display:flex}
+/* Tab 头 — 加 hover 浮起 + active 渐变 + 顶部 strip */
+.tool-tabs{display:flex;background:rgba(0,0,0,.3);border-bottom:1px solid var(--border);padding:0 var(--s5);gap:0;flex-shrink:0;position:relative}
+.tool-tab{position:relative;background:none;border:none;color:var(--text-faint);font-size:var(--t3);padding:14px 22px;cursor:pointer;transition:all .2s;font-family:inherit;font-weight:500;letter-spacing:.3px}
+.tool-tab:hover{color:var(--text);background:rgba(255,255,255,.03)}
+.tool-tab.active{color:var(--accent);background:linear-gradient(180deg,transparent,var(--accent-bg))}
+.tool-tab.active::after{content:'';position:absolute;left:22px;right:22px;bottom:0;height:2px;background:var(--accent);border-radius:2px 2px 0 0;box-shadow:0 0 8px rgba(79,195,247,.5)}
+/* Tab 内容 */
+.tool-pane{display:none;padding:var(--s5);overflow:auto;flex:1}
+.tool-pane.active{display:block;animation:fadeIn .2s ease-out}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+/* 前置条件 → 紧凑 chip (不再像 form error) */
+.tool-prereq{display:inline-flex;align-items:center;gap:var(--s2);background:rgba(255,213,79,.08);color:var(--warn);font-size:var(--t1);padding:6px 12px;border-radius:var(--r-pill);border:none;margin-bottom:var(--s4);font-weight:500;letter-spacing:.2px}
+.tool-prereq.info{background:rgba(79,195,247,.08);color:var(--accent)}
+.tool-step{margin-bottom:var(--s4)}
+.tool-step-label{font-size:var(--t1);color:var(--text-faint);margin-bottom:var(--s2);text-transform:uppercase;letter-spacing:1.2px;font-weight:600}
+.tools-row{display:flex;flex-wrap:wrap;gap:var(--s2);align-items:center}
+/* 默认按钮 — 安静 */
+.tool-task-btn{
+  background:var(--surface);border:1px solid var(--border);
+  color:var(--text);padding:10px 18px;border-radius:var(--r2);
+  font-size:var(--t3);cursor:pointer;transition:all .15s ease;
+  font-family:inherit;font-weight:500;
+}
+.tool-task-btn:hover:not(:disabled){background:var(--surface-hover);border-color:var(--border-strong);transform:translateY(-1px);box-shadow:var(--shadow-1)}
+.tool-task-btn:active:not(:disabled){transform:translateY(0)}
+.tool-task-btn:disabled{opacity:.4;cursor:not-allowed}
+/* primary 按钮 — 真 primary, 实心渐变 + 阴影 */
+.tool-task-btn.primary{
+  background:linear-gradient(135deg,#4fc3f7,#29b6f6);
+  border:none;color:#001528;font-weight:600;
+  box-shadow:0 4px 14px rgba(79,195,247,.35),inset 0 1px 0 rgba(255,255,255,.25);
+  padding:10px 22px;
+}
+.tool-task-btn.primary:hover:not(:disabled){
+  background:linear-gradient(135deg,#5fd0ff,#3fc4ff);
+  transform:translateY(-2px);
+  box-shadow:0 6px 20px rgba(79,195,247,.5),inset 0 1px 0 rgba(255,255,255,.3)
+}
+.tool-task-btn.primary:active:not(:disabled){transform:translateY(0);box-shadow:0 2px 8px rgba(79,195,247,.4)}
+/* 终止按钮 — 红色警示 */
+.tool-task-btn.cancel{
+  background:linear-gradient(135deg,#ef5350,#e53935)!important;
+  border:none!important;color:#fff!important;font-weight:600;
+  box-shadow:0 4px 14px rgba(239,83,80,.4),inset 0 1px 0 rgba(255,255,255,.2)!important;
+  animation:pulseRed 1.5s infinite;
+}
+.tool-task-btn.cancel:hover:not(:disabled){
+  background:linear-gradient(135deg,#f44336,#d32f2f)!important;
+  box-shadow:0 6px 20px rgba(239,83,80,.6)!important;
+}
+@keyframes pulseRed{0%,100%{box-shadow:0 4px 14px rgba(239,83,80,.4)}50%{box-shadow:0 4px 20px rgba(239,83,80,.7)}}
+/* 日志框 */
+.tool-log-wrap{
+  background:#05060a;border:1px solid var(--border);border-radius:var(--r2);
+  padding:var(--s3) var(--s4);
+  font-family:"JetBrains Mono","SF Mono",Consolas,"Courier New",monospace;
+  font-size:var(--t2);color:#cfd8dc;line-height:1.55;
+  max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-all;
+  margin-top:var(--s4);
+  box-shadow:inset 0 1px 3px rgba(0,0,0,.4);
+}
+.tool-log-wrap:empty::before{content:"点击上方按钮开始任务,日志会实时显示";color:var(--text-faint);font-style:italic}
+.tool-status{display:inline-block;font-size:var(--t2);padding:4px 12px;border-radius:var(--r-pill);margin-left:var(--s2);vertical-align:middle;font-weight:500}
+.tool-status.running{background:var(--accent-bg);color:var(--accent);border:1px solid rgba(79,195,247,.3)}
+.tool-status.ok{background:rgba(76,175,80,.15);color:var(--success);border:1px solid rgba(76,175,80,.3)}
+.tool-status.err{background:rgba(244,67,54,.15);color:var(--danger);border:1px solid rgba(244,67,54,.3)}
 </style>
 </head>
 <body>
+<!-- SVG icon library (Lucide-style, stroke 2, viewBox 24x24). 一次性内嵌 ~1KB,
+     用 <svg class="i"><use href="#i-xxx"/></svg> 引用, currentColor 自动跟文字色。 -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-wrench" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></symbol>
+  <symbol id="i-briefcase" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+  <symbol id="i-radio" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="1"/></symbol>
+  <symbol id="i-loader" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></symbol>
+</svg>
 <div class="header">
 <h1>WeChat Monitor</h1>
 <div class="status ok" id="st">SSE 实时</div>
 <div class="stats"><span id="cnt">0 消息</span><span id="perf"></span></div>
-<button class="settings-btn" onclick="toggleSettings()" title="通知设置">⚙️</button>
+<button class="tools-btn" onclick="toggleTools()" title="工具箱 (解密 / 导出 / 企业微信)"><svg class="i"><use href="#i-wrench"/></svg> 工具</button>
+<button class="settings-btn" onclick="toggleSettings()" title="通知设置"><svg class="i"><use href="#i-settings"/></svg></button>
+</div>
+<div id="toolsPanel">
+  <div class="tool-tabs">
+    <button class="tool-tab active" data-pane="wechat"><svg class="i"><use href="#i-chat"/></svg> 个人微信</button>
+    <button class="tool-tab" data-pane="wxwork"><svg class="i"><use href="#i-briefcase"/></svg> 企业微信</button>
+    <button class="tool-tab" data-pane="misc"><svg class="i"><use href="#i-sliders"/></svg> 工具</button>
+    <span id="toolStatus" class="tool-status" style="display:none;margin-left:auto;align-self:center;margin-right:24px"></span>
+  </div>
+
+  <div class="tool-pane active" data-pane="wechat">
+    <div class="tool-prereq"><svg class="i i-sm"><use href="#i-alert"/></svg> 前置：微信 PC 版正在运行且已登录</div>
+    <div class="tool-step">
+      <div class="tool-step-label">Step 1 — 解密</div>
+      <div class="tools-row">
+        <button class="tool-task-btn primary" data-task="wechat_decrypt">① 提取密钥 + 解密数据库</button>
+        <button class="tool-task-btn" data-task="image_key">② 提取图片密钥</button>
+      </div>
+    </div>
+    <div class="tool-step">
+      <div class="tool-step-label">Step 2 — 导出/解码（可独立运行，需先 Step 1）</div>
+      <div class="tools-row">
+        <button class="tool-task-btn" data-task="export_all">③ 导出全部聊天 (JSON)</button>
+        <button class="tool-task-btn" data-task="decode_images">④ 批量解密 .dat 图片</button>
+        <button class="tool-task-btn" data-task="sns_decrypt">⑤ 朋友圈解密 + 导出</button>
+      </div>
+    </div>
+    <div class="tool-log-wrap" id="toolLog_wechat"></div>
+  </div>
+
+  <div class="tool-pane" data-pane="wxwork">
+    <div class="tool-prereq"><svg class="i i-sm"><use href="#i-alert"/></svg> 前置：企业微信 PC 版正在运行且已登录（独立于个人微信）</div>
+    <div class="tool-step">
+      <div class="tool-step-label">Step 1 — 解密</div>
+      <div class="tools-row">
+        <button class="tool-task-btn primary" data-task="wxwork_decrypt">① 提取密钥 + 解密数据库</button>
+      </div>
+    </div>
+    <div class="tool-step">
+      <div class="tool-step-label">Step 2 — 导出</div>
+      <div class="tools-row">
+        <button class="tool-task-btn" data-task="wxwork_export">② 导出聊天 (CSV/HTML/JSON)</button>
+      </div>
+    </div>
+    <div class="tool-log-wrap" id="toolLog_wxwork"></div>
+  </div>
+
+  <div class="tool-pane" data-pane="misc">
+    <div class="tool-prereq info"><svg class="i i-sm"><use href="#i-info"/></svg> 跟微信/企微进程无关，只读已解密产物</div>
+    <div class="tool-step">
+      <div class="tool-step-label">语音 / 转码</div>
+      <div class="tools-row">
+        <button class="tool-task-btn" data-task="voice_mp3">语音转 MP3（需 ffmpeg in PATH）</button>
+      </div>
+    </div>
+    <div class="tool-log-wrap" id="toolLog_misc"></div>
+  </div>
 </div>
 <div class="settings-overlay" id="settingsOverlay" onclick="toggleSettings()"></div>
 <div class="settings-panel" id="settingsPanel">
@@ -1751,8 +2019,41 @@ a.msg-link{text-decoration:none;color:inherit}
 </div>
 </div>
 <div id="lightbox" onclick="this.classList.remove('show')"><img id="lb-img" /></div>
+<!-- 导出筛选模态框 -->
+<div class="modal-overlay" id="exportModal">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-h">
+      <h2 id="exportModalTitle">导出聊天</h2>
+      <button class="modal-close" onclick="closeExportModal()">&times;</button>
+    </div>
+    <div class="modal-b">
+      <input type="text" class="modal-search" id="exportSearch" placeholder="🔍 按名字 / wxid 搜索..." oninput="filterSessions()">
+      <div class="session-list" id="exportSessionList">
+        <div class="modal-loading">加载中...</div>
+      </div>
+      <div class="modal-selctrl">
+        <button onclick="selectAllSessions(true)">全选</button>
+        <button onclick="selectAllSessions(false)">清空</button>
+        <button onclick="selectRecentSessions(30)">选最近 30 天活跃</button>
+        <span class="modal-selcount" id="exportSelCount" style="margin-left:auto">已选 0 个</span>
+      </div>
+      <div class="modal-section" id="exportFmtSection">
+        <div class="modal-section-label">格式</div>
+        <div class="modal-fmt">
+          <label><input type="checkbox" value="csv" checked> CSV</label>
+          <label><input type="checkbox" value="html"> HTML</label>
+          <label><input type="checkbox" value="json"> JSON</label>
+        </div>
+      </div>
+    </div>
+    <div class="modal-f">
+      <button class="modal-btn secondary" onclick="closeExportModal()">取消</button>
+      <button class="modal-btn primary" id="exportConfirmBtn" onclick="confirmExport()" disabled>确认导出 →</button>
+    </div>
+  </div>
+</div>
 <div class="messages" id="msgs">
-<div class="empty" id="empty"><div class="icon">📡</div><p>等待新消息...</p><p style="margin-top:6px;font-size:11px;color:#333">WAL增量解密 · SSE推送</p></div>
+<div class="empty" id="empty"><svg class="i i-xl" style="opacity:.4;margin-bottom:12px"><use href="#i-radio"/></svg><p>等待新消息...</p><p style="margin-top:6px;font-size:11px;color:#333">WAL增量解密 · SSE推送</p></div>
 </div>
 <script>
 let n=0;
@@ -1869,6 +2170,172 @@ function toggleSettings(){
   o.classList.toggle('show',show);
   if(show) renderRules();
 }
+function toggleTools(){
+  const p=document.getElementById('toolsPanel');
+  p.classList.toggle('show');
+}
+window.__activeToolPane='wechat';
+function switchToolTab(name){
+  window.__activeToolPane=name;
+  document.querySelectorAll('.tool-tab').forEach(t=>t.classList.toggle('active', t.dataset.pane===name));
+  document.querySelectorAll('.tool-pane').forEach(p=>p.classList.toggle('active', p.dataset.pane===name));
+}
+async function cancelTool(){
+  try{
+    await fetch('/api/tool/cancel',{method:'POST'});
+  }catch(e){}
+}
+
+// —— 导出筛选模态框 ——
+window.__exportCtx = { source: null, task: null, btn: null, sessions: [] };
+
+async function openExportModal(modalKind, task, btn){
+  const source = modalKind === 'export_wxwork' ? 'wxwork' : 'wechat';
+  window.__exportCtx = { source, task, btn, sessions: [] };
+  document.getElementById('exportModalTitle').textContent =
+    source === 'wxwork' ? '导出企业微信聊天' : '导出个人微信聊天';
+  document.getElementById('exportSearch').value = '';
+  // 企微脚本支持 --formats, 个人微信脚本目前只 JSON; 隐藏个人微信的格式选项
+  document.getElementById('exportFmtSection').style.display = source === 'wxwork' ? 'block' : 'none';
+  document.getElementById('exportConfirmBtn').disabled = true;
+  document.getElementById('exportSelCount').textContent = '已选 0 个';
+  document.getElementById('exportSessionList').innerHTML = '<div class="modal-loading">加载会话列表...</div>';
+  document.getElementById('exportModal').classList.add('show');
+  try{
+    const r = await fetch('/api/sessions?source=' + source);
+    const sessions = await r.json();
+    if(sessions.error) throw new Error(sessions.error);
+    window.__exportCtx.sessions = sessions;
+    renderSessions(sessions, '');
+  }catch(e){
+    document.getElementById('exportSessionList').innerHTML =
+      '<div class="modal-loading" style="color:var(--danger)">加载失败: ' + esc(e.message) + '</div>';
+  }
+}
+function closeExportModal(){
+  document.getElementById('exportModal').classList.remove('show');
+}
+function renderSessions(sessions, filter){
+  const list = document.getElementById('exportSessionList');
+  const lo = filter.toLowerCase();
+  const filtered = sessions.filter(s =>
+    !lo || s.name.toLowerCase().includes(lo) || (s.username||'').toLowerCase().includes(lo)
+  );
+  if(!filtered.length){
+    list.innerHTML = '<div class="modal-loading">没匹配的会话</div>';
+    return;
+  }
+  list.innerHTML = filtered.map((s, idx) => {
+    const tsLabel = s.last_ts ? new Date(s.last_ts*1000).toISOString().slice(0,10) : '';
+    const typeCls = s.type === '群' ? 'grp' : (s.type === '单聊' ? 'single' : '');
+    return `<label class="session-item">
+      <input type="checkbox" data-username="${esc(s.username)}" onchange="updateSelCount()">
+      <span class="session-type ${typeCls}">${esc(s.type)}</span>
+      <span class="session-name" title="${esc(s.username)}">${esc(s.name)}</span>
+      <span class="session-ts">${tsLabel}</span>
+    </label>`;
+  }).join('');
+}
+function filterSessions(){
+  renderSessions(window.__exportCtx.sessions, document.getElementById('exportSearch').value);
+  updateSelCount();  // refilter 后保留 selection 但 count 重新统计当前可见的
+}
+function updateSelCount(){
+  const checked = document.querySelectorAll('#exportSessionList input[type=checkbox]:checked');
+  document.getElementById('exportSelCount').textContent = '已选 ' + checked.length + ' 个';
+  document.getElementById('exportConfirmBtn').disabled = checked.length === 0;
+}
+function selectAllSessions(yes){
+  document.querySelectorAll('#exportSessionList input[type=checkbox]').forEach(c => c.checked = yes);
+  updateSelCount();
+}
+function selectRecentSessions(days){
+  const cutoff = Date.now()/1000 - days*86400;
+  const list = window.__exportCtx.sessions;
+  document.querySelectorAll('#exportSessionList input[type=checkbox]').forEach(c => {
+    const u = c.dataset.username;
+    const s = list.find(x => x.username === u);
+    c.checked = s && s.last_ts >= cutoff;
+  });
+  updateSelCount();
+}
+function confirmExport(){
+  const users = [...document.querySelectorAll('#exportSessionList input[type=checkbox]:checked')]
+    .map(c => c.dataset.username);
+  const formats = [...document.querySelectorAll('#exportFmtSection input[type=checkbox]:checked')]
+    .map(c => c.value);
+  closeExportModal();
+  // 实际触发任务,带 args
+  const { task, btn } = window.__exportCtx;
+  runToolWithArgs(task, btn, { users, formats });
+}
+// 需要弹模态框先筛选会话的任务
+const NEEDS_MODAL = { 'export_all': 'export_wechat', 'wxwork_export': 'export_wxwork' };
+
+async function runTool(task, btn){
+  // 取消已运行任务
+  if(btn.classList.contains('cancel')){
+    btn.disabled = true;
+    btn.textContent = '终止中...';
+    cancelTool();
+    return;
+  }
+  // 导出类任务先弹模态框
+  if(NEEDS_MODAL[task]){
+    openExportModal(NEEDS_MODAL[task], task, btn);
+    return;
+  }
+  runToolWithArgs(task, btn, null);
+}
+
+async function runToolWithArgs(task, btn, args){
+  const s=document.getElementById('toolStatus');
+  document.querySelectorAll('.tool-task-btn').forEach(b=>{
+    if(b!==btn) b.disabled=true;
+  });
+  btn.dataset.origText = btn.textContent;
+  btn.dataset.origHtml = btn.innerHTML;
+  btn.innerHTML = '<svg class="i"><use href="#i-stop"/></svg> 终止';
+  btn.classList.add('cancel');
+  window.__runningBtn = btn;
+  const L=document.getElementById('toolLog_'+window.__activeToolPane);
+  if(L) L.textContent='';
+  s.style.display='inline-block';
+  s.className='tool-status running';
+  s.innerHTML='<svg class="i i-sm spin"><use href="#i-loader"/></svg> 运行中: '+esc(btn.dataset.origText.trim());
+  try{
+    const payload = { task: task };
+    if(args) payload.args = args;
+    const r=await fetch('/api/tool',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d=await r.json();
+    if(!r.ok){
+      s.className='tool-status err';
+      s.textContent='✗ '+(d.error||'启动失败');
+      document.querySelectorAll('.tool-task-btn').forEach(b=>{
+        b.disabled=false;
+        if(b.dataset.origHtml){b.innerHTML = b.dataset.origHtml; b.dataset.origHtml=''; b.dataset.origText='';}
+        b.classList.remove('cancel');
+      });
+    }
+  }catch(e){
+    s.className='tool-status err';
+    s.textContent='✗ 网络错误: '+e.message;
+    document.querySelectorAll('.tool-task-btn').forEach(b=>{
+      b.disabled=false;
+      if(b.dataset.origHtml){b.innerHTML = b.dataset.origHtml; b.dataset.origHtml=''; b.dataset.origText='';}
+      b.classList.remove('cancel');
+    });
+  }
+}
+// 工具按钮 + tab 切换 click handler 绑定
+document.addEventListener('DOMContentLoaded',()=>{
+  document.querySelectorAll('.tool-task-btn').forEach(b=>{
+    b.addEventListener('click',()=>runTool(b.dataset.task, b));
+  });
+  document.querySelectorAll('.tool-tab').forEach(t=>{
+    t.addEventListener('click',()=>switchToolTab(t.dataset.pane));
+  });
+});
 function beep(){
   try{
     const ctx=new(window.AudioContext||window.webkitAudioContext)();
@@ -1927,6 +2394,7 @@ function addMsg(m, animate){
   let contentHtml = renderContent(m);
 
   const dk=m.timestamp+'|'+(m.username||m.chat);
+  d.dataset.ts = m.timestamp || 0;  // 用于按 timestamp 排序定位
   d.innerHTML=`<div class="msg-header"><span class="msg-time">${m.time}</span><span class="${cc}">${esc(m.chat)}</span>${sn}<div class="msg-r"><span class="msg-type">${m.type_icon} ${m.type}</span>${ur}</div></div><div class="msg-content" data-key="${dk}">${contentHtml}</div>`;
 
   // 通知匹配检查
@@ -1936,7 +2404,21 @@ function addMsg(m, animate){
     setTimeout(()=>d.classList.remove('notify-hl'), 10000);
   }
 
-  M.insertBefore(d, M.firstChild);
+  // 按 timestamp 找正确插入位置 (降序: 大 ts 在顶, 小 ts 在底)
+  // 之前的 bug: insertBefore(d, M.firstChild) 永远插最前面,
+  // 导致 SSE 实时消息 + hidden 路径补抓的旧消息混在一起时顺序乱。
+  const ts = +d.dataset.ts;
+  const kids = M.children;
+  let inserted = false;
+  for(let i=0; i<kids.length; i++){
+    const existingTs = +(kids[i].dataset.ts || 0);
+    if(ts > existingTs){
+      M.insertBefore(d, kids[i]);
+      inserted = true;
+      break;
+    }
+  }
+  if(!inserted) M.appendChild(d);  // 比所有现有都早, 放最底
 
   if(animate){
     setTimeout(()=>d.classList.remove('hl'), 3000);
@@ -1990,6 +2472,31 @@ function connectSSE(){
       }
     }
   });
+  es.addEventListener('tool_log', ev=>{
+    const d=JSON.parse(ev.data);
+    // 写到当前激活 pane 的日志框
+    const pane=window.__activeToolPane||'wechat';
+    const L=document.getElementById('toolLog_'+pane);
+    if(L){L.textContent += d.line; L.scrollTop = L.scrollHeight;}
+  });
+  es.addEventListener('tool_done', ev=>{
+    const d=JSON.parse(ev.data);
+    const s=document.getElementById('toolStatus');
+    if(d.cancelled){
+      s.textContent = '⊘ 已终止';
+      s.className = 'tool-status err';
+    } else {
+      s.textContent = d.ok ? '✓ 完成' : ('✗ 失败 (code ' + d.exit_code + ')');
+      s.className = 'tool-status ' + (d.ok ? 'ok' : 'err');
+    }
+    // 还原所有按钮 + 把"终止"按钮还原成原文本
+    document.querySelectorAll('.tool-task-btn').forEach(b=>{
+      b.disabled=false;
+      if(b.dataset.origHtml){b.innerHTML = b.dataset.origHtml; b.dataset.origHtml=''; b.dataset.origText='';}
+      b.classList.remove('cancel');
+    });
+    window.__runningBtn = null;
+  });
   es.onerror=()=>{
     S.textContent='重连...';
     S.className='status err';
@@ -2008,6 +2515,251 @@ fetch('/api/history').then(r=>r.json()).then(ms=>{
 </script>
 </body>
 </html>'''
+
+
+# ────────────── 工具任务 (Web GUI 替代 tkinter app_gui.py 的入口) ────────────
+#
+# 复用现有 SSE 通道 (broadcast_sse + sse_clients), 后端跑子进程, 实时把 stdout
+# 推到浏览器。架构原则: 一次只允许 1 个工具任务运行 (避免两个解密同时挤内存)。
+#
+# 前端在 HTML_PAGE 顶部加一个折叠区,点按钮 POST /api/tool {task: "..."}。
+# SSE 事件用 event=tool_log / tool_done 跟原 message 事件区分。
+
+def _build_export_steps(users, formats):
+    """根据用户选择的会话 + 格式拼 export_all_chats.py argv"""
+    cmd = [sys.executable, "export_all_chats.py"]
+    if users:
+        cmd += ["--users", ",".join(users)]
+    # export_all_chats 当前只输出 JSON, formats 暂时忽略
+    # (export_messages.py 有 CSV/HTML/JSON, 但走的是另一条路径, 不在 v1 范围)
+    return [cmd]
+
+
+def _build_wxwork_export_steps(users, formats):
+    """根据用户选择拼 export_wxwork_messages.py argv (--conversation 可重复)"""
+    cmd = [sys.executable, "export_wxwork_messages.py"]
+    for u in (users or []):
+        cmd += ["--conversation", u]
+    if formats:
+        cmd += ["--formats", ",".join(formats)]
+    return [cmd]
+
+
+# task 配置:
+#   steps         — 固定 cmd 列表 (无参任务)
+#   build_steps   — fn(args)->[cmd, ...] 动态构造 (需要用户选会话/格式的导出任务)
+#   needs_modal   — 前端点这个 task 时要弹模态框 ('export_wechat' | 'export_wxwork')
+TOOL_TASKS = {
+    # —— 个人微信 ——
+    "wechat_decrypt": {
+        "name": "① 微信解密",
+        "steps": [[sys.executable, "main.py", "decrypt"]],
+    },
+    "image_key": {
+        "name": "② 图片密钥",
+        "steps": [[sys.executable, "find_image_key.py"]],
+    },
+    "export_all": {
+        "name": "③ 导出聊天",
+        "build_steps": _build_export_steps,
+        "needs_modal": "export_wechat",
+    },
+    "decode_images": {
+        "name": "④ 批量解密图片",
+        "steps": [[sys.executable, "main.py", "decode-images"]],
+    },
+    # —— 朋友圈 ——
+    "sns_decrypt": {
+        "name": "⑤ 朋友圈解密",
+        "steps": [
+            [sys.executable, "decrypt_sns.py"],
+            [sys.executable, "export_sns.py"],
+        ],
+    },
+    # —— 企业微信 ——
+    "wxwork_decrypt": {
+        "name": "⑥ 企业微信解密",
+        "steps": [
+            [sys.executable, "find_wxwork_keys.py"],
+            [sys.executable, "decrypt_wxwork_db.py"],
+        ],
+    },
+    "wxwork_export": {
+        "name": "⑦ 企业微信导出",
+        "build_steps": _build_wxwork_export_steps,
+        "needs_modal": "export_wxwork",
+    },
+    # —— 工具 ——
+    "voice_mp3": {
+        "name": "⑧ 语音转 MP3",
+        "steps": [[sys.executable, "voice_to_mp3.py"]],
+    },
+}
+
+_tool_lock = threading.Lock()
+_tool_running = {"job": None, "proc": None, "cancelled": False}  # 同时只允许一个任务
+
+
+def _list_sessions(source):
+    """列会话, 供导出筛选模态框消费。返回 [{name, username, type, last_ts}]
+    按 last_ts 降序。
+
+    source:
+      wechat — 个人微信, 从 decrypted/session/session.db 读 SessionTable
+      wxwork — 企业微信, 从 wxwork_decrypted/session.db 读 conversation_table
+    """
+    out = []
+    if source == "wechat":
+        if not os.path.exists(DECRYPTED_SESSION):
+            return []
+        # 复用 load_contact_names (静态快照即可, 模态框开时调一次性 OK)
+        names = load_contact_names()
+        try:
+            with closing(sqlite3.connect(f"file:{DECRYPTED_SESSION}?mode=ro&immutable=1", uri=True)) as conn:
+                for r in conn.execute(
+                    "SELECT username, type, last_timestamp, last_sender_display_name, summary "
+                    "FROM SessionTable WHERE username IS NOT NULL AND username != '' "
+                    "ORDER BY last_timestamp DESC"
+                ):
+                    username, type_, ts, sender, summary = r
+                    is_group = username.endswith("@chatroom") if username else False
+                    is_public = username.startswith("gh_") if username else False
+                    type_label = "群" if is_group else ("公众号" if is_public else "单聊")
+                    name = names.get(username) or sender or username
+                    out.append({
+                        "username": username,
+                        "name": name,
+                        "type": type_label,
+                        "last_ts": ts or 0,
+                        "summary": (summary or "")[:60],
+                    })
+        except Exception:
+            pass
+    elif source == "wxwork":
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(script_dir, "wxwork_decrypted", "session.db")
+        if not os.path.exists(path):
+            return []
+        try:
+            with closing(sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)) as conn:
+                conn.text_factory = lambda b: b.decode("utf-8", errors="replace") if isinstance(b, bytes) else b
+                for r in conn.execute(
+                    "SELECT id, name, last_message_time FROM conversation_table "
+                    "WHERE id IS NOT NULL AND id != '' "
+                    "ORDER BY last_message_time DESC"
+                ):
+                    cid, name, ts = r
+                    # id 前缀: R=群 / S=单聊 / E=外部/系统 / Y=其他
+                    if cid.startswith("R:"):
+                        type_label = "群"
+                    elif cid.startswith("S:"):
+                        type_label = "单聊"
+                    elif cid.startswith("E:"):
+                        type_label = "外部"
+                    else:
+                        type_label = "其他"
+                    out.append({
+                        "username": cid,
+                        "name": name or cid,
+                        "type": type_label,
+                        "last_ts": ts or 0,
+                        "summary": "",
+                    })
+        except Exception:
+            pass
+    return out
+
+
+def _broadcast_tool_event(event, **fields):
+    payload = {"event": event, **fields}
+    broadcast_sse(payload)
+
+
+def _run_tool_task(job_id, task_name, args=None):
+    """后台线程: 顺序跑 TOOL_TASKS[task_name].steps 的每条命令,实时推 SSE。
+
+    args 含用户在前端模态框选的参数 (users / formats 等), 由 build_steps
+    动态构造 cmd。固定任务 (无 build_steps) 直接用 steps。
+    """
+    task = TOOL_TASKS.get(task_name)
+    if not task:
+        _broadcast_tool_event("tool_done", job_id=job_id, ok=False,
+                              error=f"未知任务: {task_name}")
+        with _tool_lock:
+            _tool_running["job"] = None
+        return
+
+    # 动态构造 steps (导出类) 或用固定 steps
+    if "build_steps" in task:
+        a = args or {}
+        steps = task["build_steps"](a.get("users", []), a.get("formats", []))
+    else:
+        steps = task["steps"]
+
+    _broadcast_tool_event("tool_log", job_id=job_id,
+                          line=f"━━━ 开始: {task['name']} ━━━\n")
+
+    exit_code = 0
+    cancelled = False
+    for step in steps:
+        cmd_str = " ".join(step)
+        _broadcast_tool_event("tool_log", job_id=job_id,
+                              line=f"\n>>> {cmd_str}\n\n")
+        try:
+            proc = subprocess.Popen(
+                step,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                env={**os.environ,
+                     "PYTHONIOENCODING": "utf-8",
+                     "WECHAT_DECRYPT_NONINTERACTIVE": "1"},
+                bufsize=1,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                              if sys.platform == "win32" else 0,
+            )
+        except Exception as e:
+            _broadcast_tool_event("tool_log", job_id=job_id,
+                                  line=f"[ERROR] 启动失败: {e}\n")
+            exit_code = -1
+            break
+
+        # 暴露 proc 给取消路由
+        with _tool_lock:
+            _tool_running["proc"] = proc
+
+        for line in proc.stdout:
+            _broadcast_tool_event("tool_log", job_id=job_id, line=line)
+            with _tool_lock:
+                if _tool_running.get("cancelled"):
+                    break
+        proc.wait()
+        with _tool_lock:
+            _tool_running["proc"] = None
+            if _tool_running.get("cancelled"):
+                cancelled = True
+                _broadcast_tool_event("tool_log", job_id=job_id,
+                                      line=f"\n[CANCELLED] 任务被用户终止\n")
+                break
+        if proc.returncode != 0:
+            _broadcast_tool_event("tool_log", job_id=job_id,
+                                  line=f"\n[FAIL] 返回码 {proc.returncode}\n")
+            exit_code = proc.returncode
+            break
+
+    if cancelled:
+        _broadcast_tool_event("tool_done", job_id=job_id, ok=False,
+                              exit_code=-15, cancelled=True)
+    else:
+        _broadcast_tool_event("tool_done", job_id=job_id, ok=(exit_code == 0),
+                              exit_code=exit_code)
+    with _tool_lock:
+        _tool_running["job"] = None
+        _tool_running["proc"] = None
+        _tool_running["cancelled"] = False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2120,6 +2872,98 @@ class Handler(BaseHTTPRequestHandler):
                 with sse_lock:
                     if q in sse_clients:
                         sse_clients.remove(q)
+        elif self.path == "/api/sessions" or self.path.startswith("/api/sessions?"):
+            # 列会话(用于导出筛选模态框)
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            source = params.get("source", ["wechat"])[0]
+            try:
+                sessions = _list_sessions(source)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(json.dumps(sessions, ensure_ascii=False).encode())
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if self.path == "/api/tool":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode("utf-8") if length else "{}"
+                req = json.loads(body)
+                task_name = req.get("task", "")
+                task_args = req.get("args", {}) or {}
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": f"bad request: {e}"}).encode())
+                return
+
+            if task_name not in TOOL_TASKS:
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": f"未知任务: {task_name}",
+                                             "available": list(TOOL_TASKS)}).encode())
+                return
+
+            with _tool_lock:
+                if _tool_running["job"]:
+                    self.send_response(409)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "error": "已有任务在跑",
+                        "running_job": _tool_running["job"],
+                    }).encode())
+                    return
+                job_id = "j_" + uuid.uuid4().hex[:8]
+                _tool_running["job"] = job_id
+
+            threading.Thread(target=_run_tool_task,
+                             args=(job_id, task_name, task_args),
+                             daemon=True).start()
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "job_id": job_id,
+                "task": task_name,
+                "name": TOOL_TASKS[task_name]["name"],
+            }).encode())
+        elif self.path == "/api/tool/cancel":
+            with _tool_lock:
+                proc = _tool_running.get("proc")
+                job = _tool_running.get("job")
+                if not proc or not job:
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "无运行中任务"}).encode())
+                    return
+                _tool_running["cancelled"] = True
+            try:
+                proc.terminate()
+                # 给 1.5 秒优雅退, 否则强杀
+                try:
+                    proc.wait(timeout=1.5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            except Exception as e:
+                pass  # 进程可能正好自己退了
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"job_id": job, "cancelled": True}).encode())
         else:
             self.send_error(404)
 
@@ -2129,20 +2973,43 @@ class ThreadedServer(ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
 
 
-def main():
-    print("=" * 60, flush=True)
-    print("  微信实时监听 (WAL增量 + SSE推送)", flush=True)
-    print("=" * 60, flush=True)
+def _start_monitor_if_ready():
+    """如果 keys 已存在且能解出 session.db, 启动监听线程; 否则跳过。
 
-    with open(KEYS_FILE, encoding="utf-8") as f:
-        keys = strip_key_metadata(json.load(f))
+    用户在 Web UI 工具箱点 "① 提取密钥 + 解密数据库" 后, keys 文件就会
+    存在。届时刷新页面即可激活监听 (重启 monitor_web 或者下次访问 UI
+    时再尝试启动)。
+
+    返回 True = 监听已启动, False = 未启动 (UI 仍可用作工具箱)。
+    """
+    if not os.path.exists(KEYS_FILE):
+        print(f"[!] 未找到 keys 文件: {KEYS_FILE}", flush=True)
+        print("    Web UI 仍可用作工具箱 (从右上角 🛠️ 工具 启动 '① 提取密钥')",
+              flush=True)
+        print("    解密完成后重启本进程, 监听会自动启动\n", flush=True)
+        return False
+
+    try:
+        with open(KEYS_FILE, encoding="utf-8") as f:
+            keys = strip_key_metadata(json.load(f))
+    except Exception as e:
+        print(f"[!] 读取 keys 文件失败: {e}", flush=True)
+        print("    Web UI 仍可用作工具箱\n", flush=True)
+        return False
 
     session_key_info = get_key_info(keys, os.path.join("session", "session.db"))
     if not session_key_info:
-        print("[ERROR] 找不到 session.db 的密钥", flush=True)
-        sys.exit(1)
+        print("[!] keys 文件里没有 session.db 密钥", flush=True)
+        print("    可能 keys 是部分提取的, 工具箱 → '① 提取密钥' 重跑一次\n",
+              flush=True)
+        return False
+
     enc_key = bytes.fromhex(session_key_info["enc_key"])
     session_db = os.path.join(DB_DIR, "session", "session.db")
+    if not os.path.exists(session_db):
+        print(f"[!] session.db 不存在: {session_db}", flush=True)
+        print("    检查 config.json 的 db_dir 是否对应当前微信账号\n", flush=True)
+        return False
 
     print("加载联系人...", flush=True)
     contact_names = load_contact_names()
@@ -2170,7 +3037,7 @@ def main():
 
     db_cache = MonitorDBCache(keys, MONITOR_CACHE_DIR)
 
-    # 后台预热所有 message DB（图片/emoji 解密必需）
+    # 后台预热所有 message DB
     def _warmup():
         try:
             t0 = time.perf_counter()
@@ -2188,16 +3055,26 @@ def main():
                     print(f"[warmup] {k} 失败: {e}", flush=True)
         except Exception as e:
             print(f"[warmup] 异常: {e}", flush=True)
-        # 构建 emoji 映射（独立解密，不走 cache）
         _build_emoji_lookup(keys)
         print(f"[warmup] 全部完成 {(time.perf_counter()-t0)*1000:.0f}ms", flush=True)
     threading.Thread(target=_warmup, daemon=True).start()
 
-    t = threading.Thread(target=monitor_thread, args=(enc_key, session_db, contact_names, db_cache, username_db_map), daemon=True)
+    t = threading.Thread(target=monitor_thread,
+                         args=(enc_key, session_db, contact_names, db_cache, username_db_map),
+                         daemon=True)
     t.start()
+    return True
+
+
+def main():
+    print("=" * 60, flush=True)
+    print("  WeChat Decrypt — Web UI + 实时监听", flush=True)
+    print("=" * 60, flush=True)
+
+    _start_monitor_if_ready()
 
     server = ThreadedServer(('0.0.0.0', PORT), Handler)
-    print(f"\n=> http://localhost:{PORT}", flush=True)
+    print(f"=> http://localhost:{PORT}", flush=True)
     print("Ctrl+C 停止\n", flush=True)
 
     try:

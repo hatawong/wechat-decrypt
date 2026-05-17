@@ -171,13 +171,17 @@ def ensure_keys(keys_file, db_dir):
 def show_status():
     """显示当前数据状态"""
     cfg = {}
-    config_file = "config.json"
+    # 走 config._config_file_path() 而不是硬编码 "config.json"
+    # 这样打包成 exe 后 (cwd 可能任意位置) 仍能找到正确的 config
+    from config import _config_file_path
+    config_file = _config_file_path()
     if os.path.exists(config_file):
         with open(config_file, encoding="utf-8") as f:
             cfg = json.load(f)
-        print(f"[config] db_dir = {cfg.get('db_dir', '?')}")
+        print(f"[config] {config_file}")
+        print(f"         db_dir = {cfg.get('db_dir', '?')}")
     else:
-        print("[config] 未找到 config.json")
+        print(f"[config] 未找到 {config_file}")
 
     keys_files = sorted(glob.glob("all_keys*.json"))
     print(f"[keys]   {len(keys_files)} 个密钥文件")
@@ -261,6 +265,16 @@ def print_usage():
     print("  python main.py status         显示当前状态和磁盘用量")
 
 
+def _call_with_argv(func, argv):
+    """调用子命令 main() 时临时隔离 sys.argv，避免 argparse 读到外层命令。"""
+    old_argv = sys.argv[:]
+    try:
+        sys.argv = argv
+        return func()
+    finally:
+        sys.argv = old_argv
+
+
 def main():
     print("=" * 60)
     print("  WeChat Decrypt")
@@ -301,19 +315,19 @@ def main():
         print("[*] 开始解密全部数据库...")
         print()
         from decrypt_db import main as decrypt_all
-        decrypt_all()
+        _call_with_argv(decrypt_all, ["decrypt_db.py", *sys.argv[2:]])
 
     elif cmd in ("export", "all"):
         print("[*] 开始解密全部数据库...")
         print()
         from decrypt_db import main as decrypt_all
-        decrypt_all()
+        _call_with_argv(decrypt_all, ["decrypt_db.py"])
         print()
         print("[*] 开始批量导出聊天记录...")
         print()
         from export_all_chats import main as export_all
         try:
-            export_all()
+            _call_with_argv(export_all, ["export_all_chats.py"])
         except SystemExit:
             pass
 

@@ -28,6 +28,21 @@ V2_MAGIC = b'\x07\x08\x56\x32'       # 前 4 字节用于快速检测
 V2_MAGIC_FULL = b'\x07\x08V2\x08\x07' # 完整 6 字节签名
 V1_MAGIC_FULL = b'\x07\x08V1\x08\x07' # V1 签名 (固定 key)
 
+
+def aligned_aes_block_size(aes_size):
+    """V1/V2 .dat AES 区段的实际字节数 (AES-CBC + PKCS7 总额外加 16 字节 padding)。
+
+    aes_size 不是 16 倍数: aligned = 向上对齐到 16 (aes_size + (16 - aes_size%16))
+    aes_size 是 16 倍数:   aligned = aes_size + 16 (完整 padding 块)
+
+    canonical 实现, 给 decrypt_sns.py / export_sns.py / decode_image.py 共用。
+    早期 wx-dat 风格的 bitwise trick `aes_size - ~(~aes_size % 16)` 数学等价但
+    可读性差, 现在用清晰版本。
+    """
+    if aes_size % 16:
+        return aes_size + (16 - aes_size % 16)
+    return aes_size + 16
+
 # 常见图片格式的 magic bytes (按长度降序排列，避免短 magic 假阳性)
 IMAGE_MAGIC = {
     'png': [0x89, 0x50, 0x4E, 0x47],
@@ -156,10 +171,7 @@ def v2_decrypt_file(dat_path, out_path=None, aes_key=None, xor_key=0x88):
     if sig == V1_MAGIC_FULL:
         aes_key = b'cfcd208495d565ef'  # md5("0")[:16]
 
-    # AES 对齐: PKCS7 填充使实际密文 >= aes_size，向上对齐到 16
-    # 当 aes_size 是 16 的倍数时，还需要加 16 (完整填充块)
-    aligned_aes_size = aes_size
-    aligned_aes_size -= ~(~aligned_aes_size % 16)  # 同 wx-dat 的公式
+    aligned_aes_size = aligned_aes_block_size(aes_size)
 
     offset = 15
     if offset + aligned_aes_size > len(data):

@@ -299,6 +299,12 @@ def main():
         action="store_true",
         help="预览模式：显示将导出的会话数和新消息数，不实际写入",
     )
+    parser.add_argument(
+        "--users",
+        default=None,
+        help="只导出指定 username 的会话, 逗号分隔 (如 wxid_xxx,12345@chatroom). "
+             "为空时导出全部 (旧行为). 也可用 env WECHAT_EXPORT_USERS",
+    )
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -337,6 +343,18 @@ def main():
     except sqlite3.Error as e:
         print(f"会话数据库查询失败: {e}", file=sys.stderr)
         sys.exit(1)
+
+    # username 白名单过滤 (--users 参数 / WECHAT_EXPORT_USERS 环境变量)
+    users_filter_raw = args.users or os.environ.get("WECHAT_EXPORT_USERS", "")
+    if users_filter_raw.strip():
+        wanted = {u.strip() for u in users_filter_raw.split(",") if u.strip()}
+        before = len(sessions)
+        sessions = [u for u in sessions if u in wanted]
+        print(f"按 --users 过滤: {before} → {len(sessions)} 会话")
+        if not sessions:
+            print(f"[!] 指定的 username 列表跟会话表没交集 (wanted={list(wanted)[:5]}...)",
+                  file=sys.stderr)
+            sys.exit(1)
 
     names = mcp_server.get_contact_names()
 
