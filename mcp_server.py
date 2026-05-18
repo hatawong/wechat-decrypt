@@ -16,6 +16,7 @@ import xml.etree.ElementTree as ET
 from Crypto.Cipher import AES
 from mcp.server.fastmcp import FastMCP
 import zstandard as zstd
+from config import _config_file_path, _DEFAULT
 from decode_image import ImageResolver
 from key_utils import get_key_info, key_path_variants, strip_key_metadata
 
@@ -30,13 +31,16 @@ WAL_FRAME_HEADER_SZ = 24
 
 # ============ 配置加载 ============
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+CONFIG_FILE = _config_file_path()
 
-with open(CONFIG_FILE, encoding="utf-8") as f:
-    _cfg = json.load(f)
+try:
+    with open(CONFIG_FILE, encoding="utf-8") as f:
+        _cfg = json.load(f)
+except FileNotFoundError:
+    _cfg = dict(_DEFAULT)
 for _key in ("keys_file", "decrypted_dir"):
     if _key in _cfg and not os.path.isabs(_cfg[_key]):
-        _cfg[_key] = os.path.join(SCRIPT_DIR, _cfg[_key])
+        _cfg[_key] = os.path.join(os.path.dirname(CONFIG_FILE), _cfg[_key])
 
 DB_DIR = _cfg["db_dir"]
 KEYS_FILE = _cfg["keys_file"]
@@ -55,8 +59,11 @@ if not DECODED_IMAGE_DIR:
 elif not os.path.isabs(DECODED_IMAGE_DIR):
     DECODED_IMAGE_DIR = os.path.join(SCRIPT_DIR, DECODED_IMAGE_DIR)
 
-with open(KEYS_FILE, encoding="utf-8") as f:
-    ALL_KEYS = strip_key_metadata(json.load(f))
+try:
+    with open(KEYS_FILE, encoding="utf-8") as f:
+        ALL_KEYS = strip_key_metadata(json.load(f))
+except FileNotFoundError:
+    ALL_KEYS = {}
 
 # ============ 解密函数 ============
 
@@ -222,7 +229,7 @@ atexit.register(_cache.cleanup)
 # ============ 联系人缓存 ============
 
 _contact_names = None  # {username: display_name}
-_contact_full = None   # [{username, nick_name, remark}]
+_contact_full = None   # [{username, nick_name, remark, alias, description, phone}]
 _contact_tags = None   # {label_id: {name, sort_order, members: [{username, display_name}]}}
 _self_username = None
 _contact_db_mtime = 0  # mtime of the decrypted contact.db when caches were last populated
@@ -245,11 +252,47 @@ def _load_contacts_from(db_path):
     full = []
     conn = sqlite3.connect(db_path)
     try:
-        for r in conn.execute("SELECT username, nick_name, remark FROM contact").fetchall():
-            uname, nick, remark = r
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(contact)").fetchall()
+        }
+        optional_columns = {
+            "alias": "",
+            "description": "",
+            "phone": "",
+            "phone_number": "",
+            "mobile": "",
+            "mobile_phone": "",
+            "telephone": "",
+        }
+        select_columns = ["username", "nick_name", "remark"]
+        select_columns.extend(
+            col for col in optional_columns
+            if col in columns and col not in select_columns
+        )
+        rows = conn.execute(
+            "SELECT " + ", ".join(f"[{col}]" for col in select_columns)
+            + " FROM contact"
+        ).fetchall()
+        for r in rows:
+            data = dict(zip(select_columns, r))
+            uname = data.get("username")
+            nick = data.get("nick_name")
+            remark = data.get("remark")
             display = remark if remark else nick if nick else uname
             names[uname] = display
-            full.append({'username': uname, 'nick_name': nick or '', 'remark': remark or ''})
+            phone = ""
+            for col in ("phone", "phone_number", "mobile", "mobile_phone", "telephone"):
+                if data.get(col):
+                    phone = data.get(col) or ""
+                    break
+            full.append({
+                'username': uname,
+                'nick_name': nick or '',
+                'remark': remark or '',
+                'alias': data.get("alias") or '',
+                'description': data.get("description") or '',
+                'phone': phone,
+            })
     finally:
         conn.close()
     return names, full
@@ -304,6 +347,20 @@ def get_contact_names():
 def get_contact_full():
     get_contact_names()
     return _contact_full or []
+
+
+def get_contact_tag_names_by_username():
+    tags = _load_contact_tags()
+    by_username = {}
+    for tag in tags.values():
+        name = tag.get('name') or ''
+        if not name:
+            continue
+        for member in tag.get('members', []):
+            username = member.get('username')
+            if username:
+                by_username.setdefault(username, []).append(name)
+    return by_username
 
 
 def _extract_pb_field_30(data):

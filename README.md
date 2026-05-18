@@ -218,9 +218,22 @@ py -m pip install --user -r requirements.txt
 | 解密全部数据库 | `python decrypt_db.py` |
 | 启动 Web UI（实时消息） | `python main.py` |
 | 批量导出聊天记录 | `python export_all_chats.py` |
+| 生成导出计划 CSV（黑名单，默认） | `python export_all_chats.py --write-plan-csv export_plan.csv` |
+| 生成导出计划 CSV（白名单） | `python export_all_chats.py --write-plan-csv export_plan.csv --plan-mode whitelist` |
+| 按计划 CSV 导出（黑名单，默认） | `python export_all_chats.py output_dir --from-plan-csv export_plan.csv` |
+| 按计划 CSV 导出（白名单） | `python export_all_chats.py output_dir --from-plan-csv export_plan.csv --plan-mode whitelist` |
 | 批量导出 + 语音转录 | `python export_all_chats.py --with-transcriptions` |
 | 转录单个文件语音 | `python transcribe_chat.py input.json [output.json]` |
 | 注册 MCP Server（Claude） | `claude mcp add wechat -- python /path/to/mcp_server.py` |
+
+批量导出会在输出目录自动维护 `_export_index.json`，用稳定的 `username`
+追踪当前 JSON 文件。再次导出时如果联系人备注或群名变化，会先把旧文件
+重命名为新的可读文件名；如果同名文件属于另一个 `username`，会追加
+`__<username>` 后缀避免覆盖。
+
+导出计划 CSV 支持两种模式：默认 `blacklist` 模式下只有 `export=0`
+的行会被跳过，空值、`1` 或没有 `export` 列都会导出；`whitelist`
+模式下只有明确 `export=1` 的行会导出。
 
 ### Web UI
 
@@ -385,7 +398,7 @@ make help       # 列出所有命令
 
 | 文件 | 说明 |
 |---|---|
-| `export_all_chats.py` | 批量导出全部聊天为 JSON (含 `-t` 转录 / `-i` 增量 / 日期范围 / `--dry-run`) |
+| `export_all_chats.py` | 批量导出全部聊天为 JSON (含 CSV 计划选择、`-t` 转录、`-i` 增量、日期范围、`--dry-run`) |
 | `export_chat.py` | 单会话 JSON 导出 (供 `export_all_chats` 调用) |
 | `chat_export_helpers.py` | JSON 导出共享格式化函数 (避免漂移) |
 | `export_messages.py` | CSV / HTML / JSON 三种格式导出, 图片可内联 (PR #107) |
@@ -504,8 +517,19 @@ build.bat                    # → dist\WeChatDecrypt.exe (~20MB)
 ```
 
 **单 exe 默认入口是 Web UI** (双击 → 自动开浏览器), 因为 Web UI 体验更好。
-要打包成 tkinter 入口的话改 `WeChatDecrypt.spec` 里的 `Analysis(['monitor_web.py'])`
-为 `Analysis(['app_gui.py'])` 再 `build.bat`。
+同一个 exe 也支持 CLI 子命令:
+
+```powershell
+.\WeChatDecrypt.exe --help
+.\WeChatDecrypt.exe status
+.\WeChatDecrypt.exe decrypt
+.\WeChatDecrypt.exe export --from-plan-csv export_plan.csv
+.\WeChatDecrypt.exe export-all --write-plan-csv export_plan.csv
+```
+
+要打包成 tkinter 入口的话改 `WeChatDecrypt.spec` 里的
+`Analysis(['wechat_decrypt_launcher.py'])` 为 `Analysis(['app_gui.py'])`
+再 `build.bat`。
 
 > 语音转 MP3 需要系统安装 [FFmpeg](https://ffmpeg.org/download.html) 并加入 PATH。
 
