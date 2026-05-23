@@ -269,10 +269,15 @@ def _load_contacts_from(db_path):
             col for col in optional_columns
             if col in columns and col not in select_columns
         )
-        rows = conn.execute(
+        # 过滤群成员 (local_type=3, 每个群每个成员一条 → 数量爆炸 → 共 9416 假联系人)
+        # 仅在 local_type 列存在时加 WHERE, 兼容老版本 schema (#117 fix)
+        sql = (
             "SELECT " + ", ".join(f"[{col}]" for col in select_columns)
             + " FROM contact"
-        ).fetchall()
+        )
+        if "local_type" in columns:
+            sql += " WHERE local_type != 3"
+        rows = conn.execute(sql).fetchall()
         for r in rows:
             data = dict(zip(select_columns, r))
             uname = data.get("username")

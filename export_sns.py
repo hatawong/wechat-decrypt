@@ -5,7 +5,10 @@
 汇总文件: <output_base_dir>/<display_name>/SNS/timeline.json
 时间线:   <output_base_dir>/<display_name>/SNS/timeline.html
 """
+import base64
+import binascii
 import bisect
+import html
 import os
 import sys
 import json
@@ -16,6 +19,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from urllib.request import urlopen, Request
 from urllib.error import URLError
+
+import zstandard as zstd
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -28,6 +33,106 @@ from decode_image import aligned_aes_block_size
 # (朋友圈 timeline XML 含媒体列表 + 评论, 实测可达几十KB; 给 200K 余量)。
 _SNS_XML_UNSAFE_RE = re.compile(r'<!DOCTYPE|<!ENTITY', re.IGNORECASE)
 _SNS_XML_MAX_LEN = 200_000
+
+# SnsTimeLine.content 实际有 4 种编码形态（不同 WeChat 版本/历史时段）：
+#   1. bytes（zstd 压缩，magic 28 B5 2F FD）或裸 UTF-8 bytes
+#   2. 已是 plain XML 字符串
+#   3. hex 字符串（整段 0-9a-f，偶数长度）
+#   4. base64 字符串（A-Za-z0-9+/=）
+# 直接喂 ET.fromstring 时，后三种以 ParseError 静默返回 None，整条 row 丢失。
+_SNS_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+_SNS_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+_SNS_BASE64_RE = re.compile(r"^[A-Za-z0-9+/=]+$")
+
+# 2013-2017 老朋友圈 XML 含 ElementTree 无法接受的字符：
+#   - 裸 &（URL 里的 query string，应该是 &amp;）
+#   - 文本字段里裸 < >（用户在 contentDesc 等里手打的尖括号）
+#   - 控制字符（\x00-\x08 等 XML 1.0 禁字符）
+# CDATA 块内的 & < > 是合法的，不能动 —— 必须先把 CDATA 圈出来再清洗外面。
+_SNS_INVALID_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_SNS_CDATA_BLOCK_RE = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
+_SNS_BARE_AMP_RE = re.compile(
+    r"&(?!(amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)"
+)
+_SNS_TEXT_ONLY_NODES = (
+    "content", "title", "description", "nickname", "contentDesc",
+    "appname", "sourceName", "sourcename", "poiName", "displayName",
+    "feeddesc",
+)
+_SNS_TEXT_NODE_RE = re.compile(
+    r"(<(" + "|".join(_SNS_TEXT_ONLY_NODES) + r")\b[^>]*>)(.*?)(</\2>)",
+    re.DOTALL,
+)
+
+
+def _decode_sns_content_blob(value):
+    """把 SnsTimeLine.content 列(任意编码形态)转成 UTF-8 XML 字符串。
+
+    bytes 优先尝试 zstd 解压；字符串按 plain XML / hex / base64 顺序检测。
+    无法识别时返回原值的 string 形态，让上层 ET.fromstring 自然 ParseError。
+    None / 空值 → 空字符串。
+    """
+    if value is None:
+        return ""
+
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+        if raw.startswith(_SNS_ZSTD_MAGIC):
+            try:
+                raw = zstd.ZstdDecompressor().decompress(raw)
+            except Exception:
+                pass
+        return html.unescape(raw.decode("utf-8", errors="ignore").strip())
+
+    text = str(value).strip()
+    if not text:
+        return ""
+    if text.lstrip().startswith("<"):
+        return html.unescape(text)
+
+    compact = "".join(text.split())
+    if len(compact) >= 16 and len(compact) % 2 == 0 and _SNS_HEX_RE.match(compact):
+        try:
+            return _decode_sns_content_blob(bytes.fromhex(compact))
+        except ValueError:
+            pass
+    if len(compact) >= 24 and len(compact) % 4 == 0 and _SNS_BASE64_RE.match(compact):
+        try:
+            return _decode_sns_content_blob(base64.b64decode(compact, validate=True))
+        except (ValueError, binascii.Error):
+            pass
+    return html.unescape(text)
+
+
+def _sanitize_sns_pseudo_xml(xml_text):
+    """修 WeChat 老朋友圈 XML 的非法字符，让 ElementTree 能解析。
+
+    CDATA 块内不动；块外把裸 & 转成 &amp;。
+    text-only 节点（content/title/description/...）内部的裸 < > 转义掉。
+    控制字符直接剥除。
+    """
+    s = _SNS_INVALID_CTRL_RE.sub("", xml_text)
+    parts = []
+    last = 0
+    for m in _SNS_CDATA_BLOCK_RE.finditer(s):
+        head = s[last:m.start()]
+        parts.append(_SNS_BARE_AMP_RE.sub("&amp;", head))
+        parts.append(m.group(0))
+        last = m.end()
+    parts.append(_SNS_BARE_AMP_RE.sub("&amp;", s[last:]))
+    out = "".join(parts)
+
+    def _esc(m):
+        open_tag, _, text, close_tag = (
+            m.group(1), m.group(2), m.group(3), m.group(4)
+        )
+        return (
+            open_tag
+            + text.replace("<", "&lt;").replace(">", "&gt;")
+            + close_tag
+        )
+
+    return _SNS_TEXT_NODE_RE.sub(_esc, out)
 
 _cfg = load_config()
 DECRYPTED_DIR = _cfg["decrypted_dir"]
@@ -430,17 +535,24 @@ def _parse_media_list(timeline_obj):
 
 
 def _parse_timeline_xml(content_xml):
-    """解析 SnsTimeLine 的 Content XML，返回结构化数据"""
+    """解析 SnsTimeLine 的 Content XML，返回结构化数据。
+
+    content_xml 入参可能是 bytes / zstd 字节 / hex 串 / base64 串 / plain XML，
+    先 decode 再 sanitize 老 XML 脏数据（裸 & < > 控制字符），最后才喂 ET。
+    """
     if not content_xml:
         return None
-    if len(content_xml) > _SNS_XML_MAX_LEN:
+    decoded = _decode_sns_content_blob(content_xml)
+    if not decoded:
         return None
-    if _SNS_XML_UNSAFE_RE.search(content_xml):
+    if len(decoded) > _SNS_XML_MAX_LEN:
+        return None
+    if _SNS_XML_UNSAFE_RE.search(decoded):
         # XXE 防护: 拒绝 DOCTYPE/ENTITY,避免恶意朋友圈 XML 通过 entity expansion
         # 或外部实体引用执行 SSRF/读取本地文件
         return None
     try:
-        root = ET.fromstring(content_xml)
+        root = ET.fromstring(_sanitize_sns_pseudo_xml(decoded))
     except ET.ParseError:
         return None
 
