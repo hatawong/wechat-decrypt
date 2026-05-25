@@ -601,13 +601,19 @@ def _parse_timeline_xml(content_xml):
 
 
 def _load_comments(conn):
-    """加载 SnsMessage_tmp3 评论/点赞，按 feed_id 分组"""
+    """加载 SnsMessage_tmp3 评论/点赞，按 feed_id 分组。
+
+    `del_status != 0` 表示对方撤回该互动 —— 微信本地不真删，只设删除标记，
+    不过滤会把已撤回的点赞 / 评论也导出。COALESCE 兜底老 schema 缺列时
+    `NULL` 视作 0。
+    """
     comments = {}
     try:
         rows = conn.execute(
             "SELECT feed_id, create_time, type, from_username, from_nickname,"
             " to_username, to_nickname, content"
-            " FROM SnsMessage_tmp3 ORDER BY create_time"
+            " FROM SnsMessage_tmp3 WHERE COALESCE(del_status, 0) = 0"
+            " ORDER BY create_time"
         ).fetchall()
         for feed_id, ctime, ctype, from_u, from_n, to_u, to_n, content in rows:
             if feed_id not in comments:

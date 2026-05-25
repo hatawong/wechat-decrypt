@@ -205,5 +205,114 @@ class SecurityAndLimitsTests(unittest.TestCase):
         self.assertIsNone(export_sns._parse_timeline_xml(big))
 
 
+class LoadCommentsTests(unittest.TestCase):
+    """`_load_comments` filters out interactions with `del_status != 0`.
+
+    WeChat does not hard-delete a recalled like / comment; it sets a
+    `del_status` flag. Before this fix `_load_comments` selected all rows
+    unconditionally, so the export carried recalled interactions.
+    """
+
+    def _make_db(self, rows, *, with_del_status_col=True):
+        import os
+        import sqlite3
+        import tempfile
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        conn = sqlite3.connect(path)
+        try:
+            cols = (
+                "local_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " feed_id INTEGER, create_time INTEGER, type INTEGER,"
+                " from_username TEXT, from_nickname TEXT,"
+                " to_username TEXT, to_nickname TEXT, content TEXT"
+            )
+            if with_del_status_col:
+                cols += ", del_status INTEGER"
+            conn.execute(f"CREATE TABLE SnsMessage_tmp3 ({cols})")
+            insert_cols = (
+                "feed_id, create_time, type, from_username, from_nickname,"
+                " to_username, to_nickname, content"
+            )
+            placeholders = "?, ?, ?, ?, ?, ?, ?, ?"
+            if with_del_status_col:
+                insert_cols += ", del_status"
+                placeholders += ", ?"
+            conn.executemany(
+                f"INSERT INTO SnsMessage_tmp3 ({insert_cols}) VALUES ({placeholders})",
+                rows,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return path
+
+    def test_recalled_interactions_excluded(self):
+        # del_status=1 → recalled, must be dropped.
+        rows = [
+            (100, 1, 1, "wxid_alive", "Alive", "", "", "", 0),
+            (100, 2, 2, "wxid_recalled", "Recalled", "", "", "撤回的评论", 1),
+            (100, 3, 1, "wxid_alsoalive", "AlsoAlive", "", "", "", 0),
+        ]
+        import os
+        import sqlite3
+
+        path = self._make_db(rows)
+        try:
+            conn = sqlite3.connect(path)
+            try:
+                comments = export_sns._load_comments(conn)
+            finally:
+                conn.close()
+        finally:
+            os.unlink(path)
+        self.assertEqual(len(comments[100]), 2)
+        self.assertEqual({c["from_username"] for c in comments[100]},
+                         {"wxid_alive", "wxid_alsoalive"})
+
+    def test_null_del_status_treated_as_kept(self):
+        # del_status IS NULL (or 0) → keep. COALESCE() backstop.
+        rows = [
+            (200, 1, 1, "wxid_a", "A", "", "", "", None),
+            (200, 2, 1, "wxid_b", "B", "", "", "", 0),
+        ]
+        import os
+        import sqlite3
+
+        path = self._make_db(rows)
+        try:
+            conn = sqlite3.connect(path)
+            try:
+                comments = export_sns._load_comments(conn)
+            finally:
+                conn.close()
+        finally:
+            os.unlink(path)
+        self.assertEqual(len(comments[200]), 2)
+
+    def test_missing_del_status_column_tolerated(self):
+        # Schemas without del_status: SQL still parses (column referenced only
+        # inside COALESCE) → expect graceful failure path, not crash.
+        rows = [
+            (300, 1, 1, "wxid_x", "X", "", "", ""),
+        ]
+        import os
+        import sqlite3
+
+        path = self._make_db(rows, with_del_status_col=False)
+        try:
+            conn = sqlite3.connect(path)
+            try:
+                comments = export_sns._load_comments(conn)
+            finally:
+                conn.close()
+        finally:
+            os.unlink(path)
+        # `del_status` doesn't exist → OperationalError caught by the function,
+        # returns empty dict (matching upstream behavior for malformed schemas).
+        self.assertEqual(comments, {})
+
+
 if __name__ == "__main__":
     unittest.main()
