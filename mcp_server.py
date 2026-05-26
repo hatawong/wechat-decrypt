@@ -775,6 +775,106 @@ def _format_namecard_text(content):
     return f"[名片] {head}: {certinfo}" if certinfo else f"[名片] {head}"
 
 
+# 微信位置消息 <location> 的字段名 → 结构化键名。
+#
+# 字段语义分类 (#121 自撤回的教训：必须逐字段过语义，不能套 #83 namecard 的
+# "丢敏感字段" 模板)。1411 条真实样本统计 + 用户分享 vs 客户端渲染二分：
+#
+#   user-shared signal (用户在地图上主动选/填) → 进 decode_location 结构化层：
+#     poiname / label / poiid / poiCategoryTips / poiPhone / poiBusinessHour /
+#     poiPriceTips / isFromPoiList / cityname / adcode / buildingId / floorName
+#   主信号坐标 (精度数字，不进单行渲染避免 LLM context 污染)：
+#     x (实际是纬度) / y (实际是经度)
+#   schema slot 但本 corpus 0% 非空 (defensive 保留，别家账号可能填)：
+#     infourl / version
+#   渲染样式 / enum / 冗余 (defensive 保留供 debug，不参与渲染决策)：
+#     maptype / scale / fromusername
+_LOCATION_TEXT_FIELDS = (
+    'label', 'poiname', 'poiid', 'poiCategoryTips', 'poiBusinessHour',
+    'poiPhone', 'poiPriceTips', 'isFromPoiList', 'cityname', 'adcode',
+    'buildingId', 'floorName', 'infourl', 'maptype', 'scale',
+    'fromusername', 'version',
+)
+
+
+def _extract_location_info(content):
+    """Parse type=48 (位置) XML into a structured dict, or return None.
+
+    返回字段在 _LOCATION_TEXT_FIELDS 之外还有 lat/lng (x/y 数值化)。
+    所有缺失字段返回空串而非 None，跟 _extract_transfer_info 一致。
+    """
+    root = _parse_xml_root(content)
+    if root is None:
+        return None
+    loc = root.find('.//location')
+    if loc is None:
+        return None
+
+    def _attr(name):
+        return _collapse_text(loc.get(name) or '')
+
+    def _f(name):
+        v = loc.get(name)
+        if v is None or v == '':
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    info = {k: _attr(k) for k in _LOCATION_TEXT_FIELDS}
+    info['lat'] = _f('x')  # 微信 x 实际是纬度
+    info['lng'] = _f('y')  # 微信 y 实际是经度
+    info['category_top'] = info['poiCategoryTips'].split(':', 1)[0] if info['poiCategoryTips'] else ''
+    return info
+
+
+def _is_location_poiname_placeholder(poiname):
+    """检测客户端在用户手扔图钉 (未选 POI) 时填的占位符。
+
+    实测样本：poiname="[位置]" / poiname="[Location]"。形如 [*] 一律视为占位符，
+    渲染层需要 fallback 到 label。
+    """
+    if not poiname:
+        return True
+    return len(poiname) >= 2 and poiname.startswith('[') and poiname.endswith(']')
+
+
+def _format_location_text(content):
+    """Parse type=48 (位置) XML into a compact human-readable line.
+
+    Source XML carries 15+ attrs (poiBusinessHour, poiPhone, adcode, buildingId,
+    floorName, maptype, scale, fromusername, infourl, ...) but the chat-log line
+    only needs 3 signals: category (顶层 poiCategoryTips 主类，形如 "主类")，
+    poiname (POI 名)，label (地址串)。经纬度精度数字进单行只会污染 LLM context；
+    电话/营业时间/价格/POI id/adcode/buildingId/floorName/version 留给
+    ``decode_location`` 结构化工具。
+
+    Fallback chain:
+      1) <location> 节点缺失 → None (caller 退到 "[位置]")
+      2) poiname 是 "[位置]"/"[Location]" 类占位符 → 用 label (用户手扔图钉场景)
+      3) poiname 与 label 都缺 → "[位置]" (不堆 lat/lng 数字)
+    """
+    info = _extract_location_info(content)
+    if not info:
+        return None
+
+    category = info['category_top']
+    head = f"[位置·{category}]" if category else "[位置]"
+    poiname = info['poiname']
+    label = info['label']
+
+    if _is_location_poiname_placeholder(poiname):
+        # 用户手扔图钉：poiname 是占位符，label 才是用户看到的描述
+        return f"{head} {label}" if label else head
+
+    if not poiname and not label:
+        return "[位置]"
+    if poiname and label and poiname != label:
+        return f"{head} {poiname} @ {label}"
+    return f"{head} {poiname or label}"
+
+
 def _format_app_message_text(content, local_type, is_group, chat_username, chat_display_name, names):
     if not content or '<appmsg' not in content:
         return None
@@ -1183,6 +1283,8 @@ def _format_message_text(local_id, local_type, content, is_group, chat_username,
         text = _format_voip_message_text(text) or "[通话]"
     elif base_type == 42:
         text = _format_namecard_text(text) or "[名片]"
+    elif base_type == 48:
+        text = _format_location_text(text) or "[位置]"
     elif base_type == 49:
         formatted = _format_app_message_text(
             text, local_type, is_group, chat_username, chat_display_name, names
@@ -3146,6 +3248,128 @@ def decode_refer(chat_name: str, local_id: int, create_time: int = 0) -> str:
     if info['refer_svrid']:
         lines.append(f"  被引用消息 server_id: {info['refer_svrid']}")
 
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def decode_location(chat_name: str, local_id: int, create_time: int = 0) -> str:
+    """读取微信位置消息 (base_type=48) 的结构化信息。
+
+    返回 POI 名、地址、品类、电话、营业时间、价格档位、城市/区划码、POI id、
+    经纬度等。get_chat_history 渲染的 ``[位置·xxx] poiname @ address`` 只挑了
+    3 个信号；本工具给所有字段。
+
+    使用流程：先用 get_chat_history 找到 [位置·xxx] 行 (local_id=N, ts=T)，
+    把 N 和 T 一起传进来。create_time(ts) 用于跨分片场景下唯一定位。
+
+    Args:
+        chat_name: 聊天对象的名字、备注名或 wxid
+        local_id: 位置消息的 local_id (从 get_chat_history 获取)
+        create_time: 消息的 unix 时间戳，从 get_chat_history 输出 ts=N 部分获取。
+            用于在 local_id 跨分片冲突时唯一定位；传 0 时若多个分片含同 local_id 会报歧义错误
+    """
+    try:
+        local_id = int(local_id)
+        create_time = int(create_time)
+    except (TypeError, ValueError):
+        return "错误: local_id 和 create_time 必须是整数"
+
+    username = resolve_username(chat_name)
+    if not username:
+        return f"找不到聊天对象: {chat_name}"
+
+    shards = _find_msg_tables_for_user(username)
+    if not shards:
+        return f"找不到 {chat_name} 的消息表"
+
+    matches = []
+    for shard in shards:
+        if not _is_safe_msg_table_name(shard['table_name']):
+            continue
+        with closing(sqlite3.connect(shard['db_path'])) as conn:
+            if create_time:
+                candidate_row = conn.execute(
+                    f"SELECT local_type, create_time, message_content, WCDB_CT_message_content "
+                    f"FROM [{shard['table_name']}] WHERE local_id=? AND create_time=?",
+                    (local_id, create_time)
+                ).fetchone()
+            else:
+                candidate_row = conn.execute(
+                    f"SELECT local_type, create_time, message_content, WCDB_CT_message_content "
+                    f"FROM [{shard['table_name']}] WHERE local_id=?",
+                    (local_id,)
+                ).fetchone()
+        if candidate_row:
+            matches.append((shard['db_path'], candidate_row))
+
+    if not matches:
+        if create_time:
+            return f"找不到 (local_id={local_id}, create_time={create_time}) 的消息 (已扫描 {len(shards)} 个分片)"
+        return f"找不到 local_id={local_id} 的消息 (已扫描 {len(shards)} 个分片)"
+    if len(matches) > 1:
+        details = []
+        for db_p, r in matches:
+            ct = r[1]
+            ts_str = datetime.fromtimestamp(ct).isoformat() if ct else '?'
+            details.append(f"{os.path.basename(db_p)} create_time={ct} ({ts_str})")
+        return (
+            f"local_id={local_id} 在 {len(matches)} 个分片中都存在，无法唯一定位:\n  "
+            + '\n  '.join(details)
+            + f"\n请加 create_time 参数：decode_location(chat_name, local_id={local_id}, create_time=N)"
+        )
+
+    _, row = matches[0]
+    local_type, _msg_create_time, content, ct_compress = row
+    base_type, _ = _split_msg_type(local_type)
+    if base_type != 48:
+        return (
+            f"不是位置消息 (local_type={local_type}, base_type={base_type})，"
+            f"位置消息应为 base_type=48"
+        )
+
+    xml_text = _decompress_content(content, ct_compress)
+    if not xml_text:
+        return "消息 content 为空或无法解码"
+
+    is_group = username.endswith('@chatroom')
+    _, xml_text = _parse_message_content(xml_text, local_type, is_group)
+
+    info = _extract_location_info(xml_text)
+    if info is None:
+        return "消息是 type=48 但缺 <location> 节点 (schema 异常)"
+
+    lines = ["位置消息:"]
+    if info['poiname']:
+        lines.append(f"  POI 名: {info['poiname']}")
+    if info['label']:
+        lines.append(f"  地址: {info['label']}")
+    if info['poiCategoryTips']:
+        lines.append(f"  品类: {info['poiCategoryTips']}")
+    if info['poiPhone']:
+        lines.append(f"  电话: {info['poiPhone']}")
+    if info['poiBusinessHour']:
+        lines.append(f"  营业时间: {info['poiBusinessHour']}")
+    if info['poiPriceTips']:
+        lines.append(f"  价格档位: {info['poiPriceTips']}")
+    if info['cityname']:
+        lines.append(f"  城市: {info['cityname']}")
+    if info['adcode']:
+        lines.append(f"  行政区划码: {info['adcode']}")
+    if info['buildingId']:
+        lines.append(f"  buildingId: {info['buildingId']}")
+    if info['floorName']:
+        lines.append(f"  楼层: {info['floorName']}")
+    if info['poiid']:
+        lines.append(f"  POI id: {info['poiid']}")
+    if info['isFromPoiList']:
+        lines.append(f"  来源: {info['isFromPoiList']} (true/1=用户从 POI 列表选择，false/0=手扔图钉)")
+    if info['lat'] is not None and info['lng'] is not None:
+        lines.append(f"  经纬度: ({info['lat']:.6f}, {info['lng']:.6f})  # 微信 x→纬度，y→经度")
+    # defensive 字段：本 corpus 实测 0% 非空，但别家账号可能填；仅在非空时展示
+    if info['infourl']:
+        lines.append(f"  infourl: {info['infourl']}")
+    if info['version']:
+        lines.append(f"  version: {info['version']}")
     return "\n".join(lines)
 
 
