@@ -110,3 +110,24 @@ pending = [m for m in data["messages"]
   `[图片]` 等。原始媒体仍在 WeChat DB 中，可用 `mcp_server.py` 中的
   辅助函数（`decode_image`、`decode_voice`）取出。
 - **群聊**中的 `sender` 是群成员解析后的显示名；当前登录用户仍为 `"me"`。
+
+## Delta JSON 输出
+
+`export_all_chats.py --delta-only --start <time> [--end <time>]` 会写入：
+
+```text
+deltas/<run_id>/manifest.json
+deltas/<run_id>/chats/*.delta.json
+```
+
+时间窗口内没有消息的会话会跳过，不生成空的 `*.delta.json` 文件。
+
+Delta 文件顶层字段与完整聊天 JSON 类似，但包含：
+
+- `schema_version`
+- `export_kind: "wechat_delta"`
+- `range.start` / `range.end`
+- `message_count`
+- `messages[].msg_uid`
+
+`msg_uid` 是下游去重用的稳定哈希，不要求调用方只依赖 `local_id`。

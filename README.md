@@ -222,6 +222,7 @@ py -m pip install --user -r requirements.txt
 | 生成导出计划 CSV（白名单） | `python export_all_chats.py --write-plan-csv export_plan.csv --plan-mode whitelist` |
 | 按计划 CSV 导出（黑名单，默认） | `python export_all_chats.py output_dir --from-plan-csv export_plan.csv` |
 | 按计划 CSV 导出（白名单） | `python export_all_chats.py output_dir --from-plan-csv export_plan.csv --plan-mode whitelist` |
+| 导出时间窗口 delta JSON（不覆盖完整 JSON） | `python export_all_chats.py output_dir --delta-only --start "2026-05-26 00:00:00" --end "2026-05-26 08:00:00"` |
 | 批量导出 + 语音转录 | `python export_all_chats.py --with-transcriptions` |
 | 转录单个文件语音 | `python transcribe_chat.py input.json [output.json]` |
 | 注册 MCP Server（Claude） | `claude mcp add wechat -- python /path/to/mcp_server.py` |
@@ -234,6 +235,10 @@ py -m pip install --user -r requirements.txt
 导出计划 CSV 支持两种模式：默认 `blacklist` 模式下只有 `export=0`
 的行会被跳过，空值、`1` 或没有 `export` 列都会导出；`whitelist`
 模式下只有明确 `export=1` 的行会导出。
+
+`--delta-only` 是无状态时间窗口导出，必须显式传 `--start`。它不会读取或
+覆盖 `exported_chats/*.json`，适合由外部调度器维护游标后定时拉取新增消息。
+时间窗口内没有消息的会话会跳过，不生成空的 `*.delta.json` 文件。
 
 ### Web UI
 
@@ -398,7 +403,7 @@ make help       # 列出所有命令
 
 | 文件 | 说明 |
 |---|---|
-| `export_all_chats.py` | 批量导出全部聊天为 JSON (含 CSV 计划选择、`-t` 转录、`-i` 增量、日期范围、`--dry-run`) |
+| `export_all_chats.py` | 批量导出全部聊天为 JSON (含 CSV 计划选择、`--delta-only` 时间窗口、`-t` 转录、`-i` 增量、日期范围、`--dry-run`) |
 | `export_chat.py` | 单会话 JSON 导出 (供 `export_all_chats` 调用) |
 | `chat_export_helpers.py` | JSON 导出共享格式化函数 (避免漂移) |
 | `export_messages.py` | CSV / HTML / JSON 三种格式导出, 图片可内联 (PR #107) |

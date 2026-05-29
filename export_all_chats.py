@@ -30,6 +30,7 @@ import sys
 import time
 from contextlib import closing
 from datetime import datetime
+from pathlib import Path
 
 import mcp_server
 
@@ -59,6 +60,7 @@ PLAN_CSV_FIELDS = [
 
 EXPORT_INDEX_FILE = "_export_index.json"
 EXPORT_INDEX_VERSION = 1
+DELTA_SCHEMA_VERSION = 1
 PLAN_MODE_BLACKLIST = "blacklist"
 PLAN_MODE_WHITELIST = "whitelist"
 _UNSAFE_FILENAME_RE = re.compile(r'[\\/:*?"<>|]')
@@ -114,6 +116,33 @@ def _empty_export_index():
 def _safe_export_filename_part(value):
     cleaned = _UNSAFE_FILENAME_RE.sub("_", str(value or "")).strip()
     return cleaned or "unknown"
+
+
+def _delta_run_id(now_ts=None):
+    ts = int(now_ts if now_ts is not None else time.time())
+    return datetime.fromtimestamp(ts).strftime("%Y%m%dT%H%M%S")
+
+
+def _delta_filename(display_name, is_group, username):
+    prefix = "group" if is_group else "single"
+    label = _safe_export_filename_part(display_name or username or "unknown")
+    user_part = _safe_export_filename_part(username)
+    return f"{prefix}_{label}__{user_part}.delta.json"
+
+
+def _content_hash_for_uid(content):
+    if content is None:
+        return ""
+    return hashlib.sha256(str(content).encode("utf-8")).hexdigest()
+
+
+def _delta_msg_uid(username, db_path, local_id, timestamp, msg_type, content):
+    db_name = os.path.basename(str(db_path or ""))
+    payload = (
+        f"{username}|{db_name}|{int(local_id)}|{int(timestamp)}|"
+        f"{msg_type or 'text'}|{_content_hash_for_uid(content)}"
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _export_filename(display_name, is_group, username=None):
@@ -1177,6 +1206,208 @@ def export_one(username, output_dir, names, transcribe=False,
     return True, len(messages), new_count, None
 
 
+def _transcribe_delta_voice_messages(username, messages):
+    for msg in messages:
+        if msg.get("type") != "voice" or msg.get("transcription"):
+            continue
+        lid = msg["local_id"]
+        try:
+            row = mcp_server._fetch_voice_row(username, lid)
+            if row is None:
+                continue
+            voice_data, create_time = row
+            wav_path, _ = mcp_server._silk_to_wav(
+                voice_data, create_time, username, lid
+            )
+            backend = _resolve_backend()
+            result = mcp_server._transcribe(wav_path, backend)
+            if result and result.get("text"):
+                msg["transcription"] = result["text"]
+            os.unlink(wav_path)
+        except Exception:
+            continue
+
+
+def export_delta_one(username, delta_root, names, run_id, start_ts,
+                     end_ts=None, transcribe=False):
+    if start_ts is None:
+        raise ValueError("delta export requires start_ts")
+
+    ctx = mcp_server._resolve_chat_context(username)
+    if ctx is None:
+        return {
+            "success": False,
+            "username": username,
+            "message_count": 0,
+            "reason": f"Cannot resolve: {username}",
+        }
+
+    display_name = ctx["display_name"]
+    message_tables = ctx["message_tables"]
+    if not message_tables:
+        return {
+            "success": False,
+            "username": username,
+            "message_count": 0,
+            "reason": "no tables",
+        }
+
+    rows_for_delta = []
+    for table_info in message_tables:
+        db_path = table_info["db_path"]
+        table_name = table_info["table_name"]
+        try:
+            with closing(sqlite3.connect(db_path)) as conn:
+                id_to_username = mcp_server._load_name2id_maps(conn)
+                rows = mcp_server._query_messages(
+                    conn,
+                    table_name,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    limit=None,
+                    oldest_first=True,
+                )
+                for row in rows:
+                    rows_for_delta.append((row, table_info, id_to_username))
+        except Exception as e:
+            return {
+                "success": False,
+                "username": username,
+                "message_count": 0,
+                "reason": f"DB query error: {e}",
+            }
+
+    rows_for_delta.sort(key=lambda item: item[0][2] or 0)
+    messages = []
+    for row, table_info, id_to_username in rows_for_delta:
+        local_id, local_type, create_time, real_sender_id, content, ct = row
+        raw_content = content
+        sender = _resolve_sender(row, ctx, names, id_to_username)
+        type_str = _msg_type_str(local_type)
+        rendered, extras = _extract_content(
+            local_id, local_type, raw_content, ct, username, display_name
+        )
+        effective_type = (extras or {}).get("type") or type_str
+        msg = {
+            "msg_uid": _delta_msg_uid(
+                username=username,
+                db_path=table_info.get("db_path"),
+                local_id=local_id,
+                timestamp=create_time,
+                msg_type=effective_type,
+                content=raw_content,
+            ),
+            "local_id": local_id,
+            "timestamp": create_time,
+            "sender": sender,
+        }
+        if effective_type != "text":
+            msg["type"] = effective_type
+        if rendered is not None:
+            msg["content"] = rendered
+        if extras:
+            for key, value in extras.items():
+                if key != "type":
+                    msg[key] = value
+        messages.append(msg)
+
+    if not messages:
+        return {
+            "success": True,
+            "skipped": True,
+            "username": username,
+            "chat": display_name,
+            "message_count": 0,
+            "reason": "no messages in delta window",
+        }
+
+    if transcribe:
+        _transcribe_delta_voice_messages(username, messages)
+
+    delta_rel_path = os.path.join(
+        "chats",
+        _delta_filename(display_name, ctx["is_group"], username),
+    )
+    delta_path = os.path.join(delta_root, "deltas", run_id, delta_rel_path)
+    output = {
+        "schema_version": DELTA_SCHEMA_VERSION,
+        "export_kind": "wechat_delta",
+        "chat": display_name,
+        "username": username,
+        "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "range": {
+            "start": _date_from_message_ts(start_ts),
+            "end": _date_from_message_ts(end_ts) if end_ts is not None else "",
+        },
+    }
+    if messages:
+        output["date_first_msg"] = _date_from_message_ts(
+            messages[0].get("timestamp")
+        )
+        output["date_last_msg"] = _date_from_message_ts(
+            messages[-1].get("timestamp")
+        )
+    if ctx["is_group"]:
+        output["is_group"] = True
+    else:
+        output.update(_contact_metadata_for_export(username, ctx["is_group"]))
+    output["message_count"] = len(messages)
+    output["messages"] = messages
+
+    os.makedirs(os.path.dirname(delta_path), exist_ok=True)
+    with open(delta_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+
+    return {
+        "success": True,
+        "username": username,
+        "chat": display_name,
+        "path": delta_rel_path.replace("\\", "/"),
+        "message_count": len(messages),
+    }
+
+
+def _write_delta_manifest(delta_root, run_id, start_ts, end_ts,
+                          chats_checked, results):
+    files = []
+    errors = []
+    for result in results:
+        if result.get("success") and result.get("message_count", 0) > 0:
+            files.append({
+                "username": result["username"],
+                "chat": result.get("chat", result["username"]),
+                "path": result["path"],
+                "message_count": result.get("message_count", 0),
+            })
+        elif not result.get("success"):
+            errors.append({
+                "username": result.get("username", ""),
+                "reason": result.get("reason", "unknown"),
+            })
+    manifest = {
+        "schema_version": DELTA_SCHEMA_VERSION,
+        "export_kind": "wechat_delta_run",
+        "run_id": run_id,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "range": {
+            "start": _date_from_message_ts(start_ts),
+            "end": _date_from_message_ts(end_ts) if end_ts is not None else "",
+        },
+        "chats_checked": chats_checked,
+        "chats_with_messages": len(files),
+        "messages_exported": sum(item["message_count"] for item in files),
+        "files": files,
+        "errors": errors,
+    }
+    manifest_path = Path(delta_root) / "deltas" / run_id / "manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
 _BACKEND_CACHE = None
 
 
@@ -1254,6 +1485,11 @@ def main(argv=None):
         help="增量导出：只追加新消息到已有 JSON 文件",
     )
     parser.add_argument(
+        "--delta-only",
+        action="store_true",
+        help="只导出 --start/--end 时间窗口内的增量 delta JSON，不读取或覆盖已有完整 JSON",
+    )
+    parser.add_argument(
         "--start",
         default=None,
         help="起始日期 (如 2025-01-01 或 Unix 时间戳)",
@@ -1292,6 +1528,8 @@ def main(argv=None):
         print(f"错误: 无法解析结束时间: {args.end}", file=sys.stderr)
         print("支持格式: 2025-01-01, 2025-01-01 14:30, 2025-01-01T14:30:00", file=sys.stderr)
         sys.exit(1)
+    if args.delta_only and start_ts is None:
+        parser.error("--delta-only requires --start to avoid accidental full export")
 
     if args.with_transcriptions:
         try:
@@ -1330,7 +1568,9 @@ def main(argv=None):
 
     # 显示模式信息
     mode = ""
-    if args.incremental:
+    if args.delta_only:
+        mode = "Delta 增量导出"
+    elif args.incremental:
         mode = "增量模式"
     if start_ts:
         start_dt = datetime.fromtimestamp(start_ts).strftime("%Y-%m-%d %H:%M")
@@ -1401,18 +1641,48 @@ def main(argv=None):
     total_new = 0
 
     total_sessions = len(sessions)
+    run_id = _delta_run_id()
+    delta_results = []
     for i, username in enumerate(sessions, 1):
         display = names.get(username, username)
         chat_t0 = time.time()
         print(f"[{i}/{total_sessions}] 开始导出: {display} ({username})", flush=True)
-        success, total_msgs, new_msgs, reason = export_one(
-            username, output_dir, names,
-            transcribe=args.with_transcriptions,
-            start_ts=start_ts,
-            end_ts=end_ts,
-            incremental=args.incremental,
-        )
+        if args.delta_only:
+            result = export_delta_one(
+                username=username,
+                delta_root=output_dir,
+                names=names,
+                run_id=run_id,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                transcribe=args.with_transcriptions,
+            )
+            delta_results.append(result)
+            success = result.get("success", False)
+            total_msgs = result.get("message_count", 0)
+            new_msgs = total_msgs
+            reason = result.get("reason")
+        else:
+            success, total_msgs, new_msgs, reason = export_one(
+                username, output_dir, names,
+                transcribe=args.with_transcriptions,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                incremental=args.incremental,
+            )
         if success:
+            elapsed = time.time() - t0
+            chat_elapsed = time.time() - chat_t0
+            eta = (elapsed / i) * (total_sessions - i) if i > 0 else 0
+            if args.delta_only and result.get("skipped"):
+                skip += 1
+                print(
+                    f"[{i}/{total_sessions}] 跳过: {display} ({reason}) "
+                    f"(本会话 {chat_elapsed:.1f}s, ETA {eta/60:.1f}分)",
+                    flush=True,
+                )
+                continue
+
             ok += 1
             total += total_msgs
             total_new += new_msgs
@@ -1420,9 +1690,6 @@ def main(argv=None):
                 label = f"+{new_msgs} new" if args.incremental else f"{total_msgs} msgs"
             else:
                 label = f"{total_msgs} msgs"
-            elapsed = time.time() - t0
-            chat_elapsed = time.time() - chat_t0
-            eta = (elapsed / i) * (total_sessions - i) if i > 0 else 0
             print(
                 f"[{i}/{total_sessions}] 完成导出: {display} - {label} "
                 f"(本会话 {chat_elapsed:.1f}s, ETA {eta/60:.1f}分)",
@@ -1449,6 +1716,17 @@ def main(argv=None):
                     f"(本会话 {chat_elapsed:.1f}s, ETA {eta/60:.1f}分)",
                     flush=True,
                 )
+
+    if args.delta_only:
+        manifest_path = _write_delta_manifest(
+            delta_root=output_dir,
+            run_id=run_id,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            chats_checked=total_sessions,
+            results=delta_results,
+        )
+        print(f"Delta manifest: {manifest_path}")
 
     elapsed = time.time() - t0
     print()
