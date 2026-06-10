@@ -262,6 +262,7 @@ def print_usage():
     print("  python main.py decode-images --help  查看 decode-images 全部选项")
     print("  python main.py export         解密 + 批量导出聊天记录")
     print("  python main.py all            从零到完成：密钥 → 解密 → 导出")
+    print("  python main.py emoticons      导出收藏的表情包")
     print("  python main.py status         显示当前状态和磁盘用量")
 
 
@@ -345,6 +346,10 @@ def main():
             else:
                 print("    未配置语音转录 backend (config.json 中设置)")
                 print("    配置后运行: python export_all_chats.py --with-transcriptions")
+
+    elif cmd == "emoticons":
+        from export_emoticons import main as export_emojis
+        export_emojis()
 
     elif cmd == "web":
         print("[*] 启动 Web UI...")

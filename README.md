@@ -225,6 +225,7 @@ py -m pip install --user -r requirements.txt
 | 导出时间窗口 delta JSON（不覆盖完整 JSON） | `python export_all_chats.py output_dir --delta-only --start "2026-05-26 00:00:00" --end "2026-05-26 08:00:00"` |
 | 批量导出 + 语音转录 | `python export_all_chats.py --with-transcriptions` |
 | 转录单个文件语音 | `python transcribe_chat.py input.json [output.json]` |
+| 导出收藏的表情包 | `python main.py emoticons` 或 `python export_emoticons.py` |
 | 注册 MCP Server（Claude） | `claude mcp add wechat -- python /path/to/mcp_server.py` |
 
 批量导出会在输出目录自动维护 `_export_index.json`，用稳定的 `username`
@@ -257,6 +258,19 @@ py -m pip install --user -r requirements.txt
 | `GET /api/history?since=1712000000` | 增量拉取 |
 | `GET /api/tags` | 联系人标签 |
 | `GET /stream` | SSE 实时消息推送 |
+
+### 表情包导出
+
+从 `emoticon.db` 解密后读取表情列表，通过 CDN 直接下载图片到本地目录。
+
+```bash
+python main.py emoticons                        # 全量导出到 ./exported_emoticons/
+python export_emoticons.py -o ./my_emojis        # 指定输出目录
+python export_emoticons.py --dry-run              # 预览模式，不下载
+python export_emoticons.py --filter "猫"          # 按关键词过滤
+```
+
+支持 NonStore（用户收藏）表情。导出格式为原始图片（GIF / JPG / PNG / WebP），文件名为表情 MD5。
 
 ### MCP Server（Claude AI 集成）
 
@@ -409,6 +423,8 @@ make help       # 列出所有命令
 | `export_messages.py` | CSV / HTML / JSON 三种格式导出, 图片可内联 (PR #107) |
 | `export_wxwork_messages.py` | 企业微信版导出 (CSV / HTML / JSON) |
 | `export_sns.py` | 朋友圈 SnsTimeLine 导出 (JSON + HTML 时间线) |
+| `emoticons.py` | 表情包公共模块 (emoticon.db 解析 + CDN 下载) |
+| `export_emoticons.py` | 表情包批量导出 CLI (`--dry-run` / `--filter` / `-o`) |
 
 </details>
 
@@ -622,6 +638,7 @@ cc -O2 -o find_all_keys_macos find_all_keys_macos.c -framework Foundation
 
 # 运行（自动查找微信进程、扫描内存、匹配 DB salt）
 sudo ./find_all_keys_macos
+```
 
 <details>
 <summary>点击展开</summary>

@@ -1,4 +1,4 @@
-.PHONY: setup build keys decrypt web export all status clean help
+.PHONY: setup build keys decrypt web export emoticons all status clean help
 
 PYTHON ?= .venv/bin/python3
 export SHELL := /bin/bash
@@ -11,8 +11,9 @@ help:
 	@echo "  make keys     提取密钥（需要 root）"
 	@echo "  make decrypt  提取密钥 + 解密全部数据库"
 	@echo "  make web      启动 Web UI（实时消息监听）"
-	@echo "  make export   解密 + 批量导出聊天记录"
-	@echo "  make all      从零到完成：setup → keys → decrypt → export"
+	@echo "  make export     解密 + 批量导出聊天记录"
+	@echo "  make emoticons  导出收藏的表情包"
+	@echo "  make all        从零到完成：setup → keys → decrypt → export"
 	@echo "  make status   显示当前数据状态和磁盘用量"
 	@echo "  make clean    交互式清理临时数据（解密库/导出/缓存）"
 	@echo ""
@@ -35,6 +36,9 @@ web:
 
 export:
 	$(PYTHON) main.py export
+
+emoticons:
+	$(PYTHON) main.py emoticons
 
 all:
 	$(PYTHON) main.py all

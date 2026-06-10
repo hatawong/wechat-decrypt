@@ -54,182 +54,52 @@ MAX_LOG = 500
 _img_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix='img')
 _hidden_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='hidden')
 
-# ---- Emoji 缓存 (md5 → {cdn_url, aes_key, encrypt_url}) ----
+# ---- Emoji 缓存 (使用 emoticons.py 公共模块) ----
+from emoticons import build_emoji_lookup as _build_emoji_lookup_mod, download_emoji as _download_emoji_mod, convert_hevc_to_jpeg as _convert_hevc_to_jpeg
+
 _emoji_lookup = {}       # md5 → dict
 _emoji_lookup_lock = threading.Lock()
-
-_emoji_keys_dict = None  # 保存 keys 引用供刷新用
+_emoji_keys_dict = None
 _emoji_last_refresh = 0
 
+
 def _build_emoji_lookup(keys_dict):
-    """从 emoticon.db 构建 emoji md5 → URL 映射（直接解密，不走 cache）"""
     global _emoji_lookup, _emoji_keys_dict, _emoji_last_refresh
     _emoji_keys_dict = keys_dict
-    key_info = get_key_info(keys_dict, os.path.join("emoticon", "emoticon.db"))
-    if not key_info:
-        print("[emoji] 无 emoticon.db key，跳过", flush=True)
-        return
-
-    src = os.path.join(DB_DIR, "emoticon", "emoticon.db")
-    if not os.path.exists(src):
-        return
-
-    import tempfile
-    dst = os.path.join(tempfile.gettempdir(), "wechat_emoticon_dec.db")
-    enc_key = bytes.fromhex(key_info["enc_key"])
-
-    try:
-        full_decrypt(src, dst, enc_key)
-        wal = src + "-wal"
-        if os.path.exists(wal):
-            decrypt_wal_full(wal, dst, enc_key)
-    except Exception as e:
-        print(f"[emoji] emoticon.db 解密失败: {e}", flush=True)
-        return
-
-    try:
-        conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
-        new_lookup = {}
-
-        # 1. NonStore 表情（有独立 cdn_url）
-        rows = conn.execute(
-            "SELECT md5, aes_key, cdn_url, encrypt_url, product_id FROM kNonStoreEmoticonTable"
-        ).fetchall()
-        # 收集每个 package 的 cdn_url 模板
-        pkg_cdn_template = {}  # package_id → cdn_url (任意一个)
-        for md5, aes_key, cdn_url, encrypt_url, product_id in rows:
-            if md5:
-                new_lookup[md5] = {
-                    'cdn_url': cdn_url or '',
-                    'aes_key': aes_key or '',
-                    'encrypt_url': encrypt_url or '',
-                }
-            if product_id and cdn_url:
-                pkg_cdn_template[product_id] = cdn_url
-
-        non_store_count = len(new_lookup)
-
-        # 2. Store 表情（尝试构造 cdn_url）
-        store_rows = conn.execute(
-            "SELECT package_id_, md5_ FROM kStoreEmoticonFilesTable"
-        ).fetchall()
-        store_added = 0
-        for pkg_id, md5 in store_rows:
-            if md5 and md5 not in new_lookup:
-                # 尝试用同 package 的模板构造 URL
-                template = pkg_cdn_template.get(pkg_id, '')
-                if template and '&' in template:
-                    # 替换 m= 参数为新 md5
-                    import re
-                    constructed = re.sub(r'm=[0-9a-f]+', f'm={md5}', template)
-                    new_lookup[md5] = {
-                        'cdn_url': constructed,
-                        'aes_key': '',
-                        'encrypt_url': '',
-                    }
-                    store_added += 1
-
-        conn.close()
+    lookup = _build_emoji_lookup_mod(keys_dict, DB_DIR)
+    if lookup:
         with _emoji_lookup_lock:
-            _emoji_lookup = new_lookup
+            _emoji_lookup = lookup
         _emoji_last_refresh = time.time()
-        print(f"[emoji] 已加载 {non_store_count} NonStore + {store_added} Store = {len(new_lookup)} 个表情映射", flush=True)
-    except Exception as e:
-        print(f"[emoji] 构建映射失败: {e}", flush=True)
-    finally:
-        try:
-            os.unlink(dst)
-        except OSError:
-            pass
+
 
 def _download_emoji(md5):
-    """从 CDN 下载表情并缓存到 decoded_images/，返回文件名或 None"""
     with _emoji_lookup_lock:
         info = _emoji_lookup.get(md5)
     if not info:
-        # Lookup miss: 刷新 emoticon.db（最多每60秒一次）
         if _emoji_keys_dict and time.time() - _emoji_last_refresh > 60:
             print(f"  [emoji] lookup miss, 刷新 emoticon.db...", flush=True)
             _build_emoji_lookup(_emoji_keys_dict)
-            with _emoji_lookup_lock:
-                info = _emoji_lookup.get(md5)
+        with _emoji_lookup_lock:
+            info = _emoji_lookup.get(md5)
         if not info:
             return None
 
-    # 先检查是否已缓存
+    # 先检查是否已缓存（旧文件名格式兼容）
     for ext in ('.gif', '.png', '.jpg', '.webp'):
         cached = os.path.join(DECODED_IMAGE_DIR, f"emoji_{md5}{ext}")
         if os.path.exists(cached):
             return f"emoji_{md5}{ext}"
 
-    cdn_url = info.get('cdn_url', '')
-    aes_key = info.get('aes_key', '')
-    encrypt_url = info.get('encrypt_url', '')
-
-    data = None
-    # 方法1: 从 cdn_url 直接下载（未加密）
-    if cdn_url:
-        try:
-            import urllib.request
-            req = urllib.request.Request(cdn_url, headers={'User-Agent': 'Mozilla/5.0'})
-            resp = urllib.request.urlopen(req, timeout=15)
-            data = resp.read()
-        except Exception as e:
-            print(f"  [emoji] cdn下载失败 {md5[:12]}: {e}", flush=True)
-
-    # 方法2: 从 encrypt_url 下载 + AES-CBC 解密
-    if not data and encrypt_url and aes_key:
-        try:
-            import urllib.request
-            req = urllib.request.Request(encrypt_url, headers={'User-Agent': 'Mozilla/5.0'})
-            resp = urllib.request.urlopen(req, timeout=15)
-            enc_data = resp.read()
-            key_bytes = bytes.fromhex(aes_key)
-            cipher = AES.new(key_bytes, AES.MODE_CBC, iv=key_bytes)
-            data = cipher.decrypt(enc_data)
-            # 去除 PKCS7 padding
-            if data:
-                pad = data[-1]
-                if 1 <= pad <= 16 and data[-pad:] == bytes([pad]) * pad:
-                    data = data[:-pad]
-        except Exception as e:
-            print(f"  [emoji] encrypt下载解密失败 {md5[:12]}: {e}", flush=True)
-
-    if not data or len(data) < 4:
-        return None
-
-    # 检测格式
-    if data[:3] == b'\xff\xd8\xff':
-        ext = '.jpg'
-    elif data[:4] == b'\x89PNG':
-        ext = '.png'
-    elif data[:3] == b'GIF':
-        ext = '.gif'
-    elif data[:4] == b'RIFF':
-        ext = '.webp'
-    elif data[:4] in (b'wxgf', b'wxam'):
-        # WXGF/WXAM 需要转换
-        ext = '.gif'
-        tmp_path = os.path.join(DECODED_IMAGE_DIR, f"emoji_{md5}.wxgf")
-        with open(tmp_path, 'wb') as f:
-            f.write(data)
-        jpg_path = _convert_hevc_to_jpeg(tmp_path, os.path.join(DECODED_IMAGE_DIR, f"emoji_{md5}.jpg"))
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        if jpg_path:
-            return f"emoji_{md5}.jpg"
-        return None
-    else:
-        ext = '.bin'
-
-    out_name = f"emoji_{md5}{ext}"
-    out_path = os.path.join(DECODED_IMAGE_DIR, out_name)
-    with open(out_path, 'wb') as f:
-        f.write(data)
-    print(f"  [emoji] 下载缓存: {out_name} ({len(data)//1024}KB)", flush=True)
-    return out_name
+    result = _download_emoji_mod(md5, _emoji_lookup, DECODED_IMAGE_DIR)
+    if result:
+        # 统一用 emoji_ 前缀（兼容旧缓存）
+        src = os.path.join(DECODED_IMAGE_DIR, result)
+        dst = os.path.join(DECODED_IMAGE_DIR, f"emoji_{result}")
+        if src != dst and os.path.exists(src):
+            os.replace(src, dst)
+        return f"emoji_{result}"
+    return None
 
 
 class MonitorDBCache:
@@ -598,51 +468,6 @@ def broadcast_sse(msg_data):
             sse_clients.remove(q)
 
 
-def _convert_hevc_to_jpeg(hevc_path, jpeg_path):
-    """将 wxgf/HEVC 文件转为 JPEG
-
-    wxgf 是微信自有格式: wxgf header + ICC profile + HEVC NAL units
-    通过扫描 HEVC VPS start code (00 00 00 01 40 01) 定位 Annex B 流，
-    再用 PyAV (ffmpeg) 解码首帧为 JPEG。
-    """
-    try:
-        import av
-
-        with open(hevc_path, 'rb') as f:
-            data = f.read()
-
-        # 扫描 HEVC Annex B VPS start code: 00 00 00 01 40 01
-        vps_sig = b'\x00\x00\x00\x01\x40\x01'
-        hevc_start = data.find(vps_sig)
-        if hevc_start < 0:
-            # fallback: 找 SPS (00 00 00 01 42 01)
-            hevc_start = data.find(b'\x00\x00\x00\x01\x42\x01')
-        if hevc_start < 0:
-            print(f"  [img] wxgf 中未找到 HEVC VPS/SPS", flush=True)
-            return None
-
-        # 提取 HEVC Annex B 流并用 PyAV 解码
-        h265_path = hevc_path + '.h265'
-        with open(h265_path, 'wb') as f:
-            f.write(data[hevc_start:])
-
-        try:
-            container = av.open(h265_path, format='hevc')
-            for frame in container.decode(video=0):
-                img = frame.to_image()
-                img.save(jpeg_path, "JPEG", quality=90)
-                container.close()
-                return jpeg_path
-            container.close()
-        finally:
-            if os.path.exists(h265_path):
-                os.unlink(h265_path)
-
-    except ImportError:
-        print(f"  [img] 需要 PyAV: pip install av", flush=True)
-    except Exception as e:
-        print(f"  [img] HEVC→JPEG 失败: {e}", flush=True)
-    return None
 
 
 # ============ 监听器 ============
