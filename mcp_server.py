@@ -2150,7 +2150,9 @@ def get_chat_history(chat_name: str, limit: int = 50, offset: int = 0, start_tim
 
     header = f"{ctx['display_name']} 的消息记录（返回 {len(lines)} 条，offset={offset}, limit={limit}）"
     if ctx['is_group']:
-        header += " [群聊]"
+        header += f" [群聊, id={ctx['username']}]"
+    elif ctx['username'] != ctx['display_name']:
+        header += f" [id={ctx['username']}]"
     if start_time or end_time:
         header += f"\n时间范围: {start_time or '最早'} ~ {end_time or '最新'}"
     if msg_types:
@@ -3499,7 +3501,8 @@ def get_chat_images(chat_name: str, limit: int = 20, offset: int = 0, start_time
             line += "  (无资源信息)"
         lines.append(line)
 
-    header = f"{display_name} 的 {len(lines)} 张图片（offset={offset}, limit={limit}）"
+    id_tag = f", id={username}" if username != display_name else ""
+    header = f"{display_name} 的 {len(lines)} 张图片（offset={offset}, limit={limit}{id_tag}）"
     if start_time or end_time:
         header += f"\n时间范围: {start_time or '最早'} ~ {end_time or '最新'}"
     return header + ":\n\n" + "\n".join(lines) + _pagination_hint(len(lines), limit, offset)
